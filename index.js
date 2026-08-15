@@ -241,6 +241,10 @@ var IdeBridge = class {
   ws;
   knownTools = [];
   lockPath;
+  /** Session working directory the bridge currently follows; `undefined` until first follow call. */
+  cwd;
+  /** Workspace folders of the lock currently selected (used to detect same-port content changes). */
+  selectedFolders = [];
   nextRequestId = 1;
   pending = /* @__PURE__ */ new Map();
   lockTimer;
@@ -258,22 +262,52 @@ var IdeBridge = class {
   /**
    * Re-select the lock by a session working directory: prefer a lock whose
    * workspace folder exactly equals `cwd`, else the newest lock. Reconnects
-   * only when the chosen lock differs from the current one.
+   * only when the chosen lock differs from the current one. The selected lock
+   * is identified by its port *and* workspace folders — a same-port lock whose
+   * `workspaceFolders` content changed (the same editor window switched
+   * projects) still triggers a rebuild, unlike a bare port comparison.
    * @param cwd - the session's working directory, or `undefined` to follow the newest lock.
    */
   followWorkspace(cwd) {
     if (this.disposed) return;
+    this.cwd = cwd;
+    this.reselect();
+  }
+  /**
+   * Re-scan locks and adopt the lock selected for {@link cwd}, or `undefined`.
+   * Rebuilds workspace filters and reconnects whenever the selected lock's
+   * identity (port or workspace folders) changed since the last adoption.
+   */
+  reselect() {
+    if (this.disposed) return;
     const candidates = scanLocks(this.lockDir, this.logger) ?? [];
-    const selected = selectLockByWorkspace(candidates, cwd);
+    const selected = selectLockByWorkspace(candidates, this.cwd);
     const lock = selected?.lock;
-    const path = selected === void 0 ? void 0 : `${lock?.port}.lock`;
-    if (path === this.lockPath) return;
-    this.lockPath = path;
+    const folders = lock?.workspaceFolders ?? [];
+    if (lock !== void 0 && this.sameSelection(lock.port, folders)) return;
+    this.adoptLock(selected);
+  }
+  /** True when `port` + `folders` describe the lock already adopted. */
+  sameSelection(port, folders) {
+    const path = `${port}.lock`;
+    if (path !== this.lockPath) return false;
+    if (folders.length !== this.selectedFolders.length) return false;
+    for (let i = 0; i < folders.length; i++) {
+      if (folders[i] !== this.selectedFolders[i]) return false;
+    }
+    return true;
+  }
+  /** Adopt a selected lock (or `undefined`): reset filters and reconnect. */
+  adoptLock(selected) {
+    const lock = selected?.lock;
+    const folders = lock?.workspaceFolders ?? [];
+    this.lockPath = selected === void 0 ? void 0 : `${lock?.port}.lock`;
+    this.selectedFolders = folders;
     this.knownTools = [];
-    this.workspaceRoots = uniqueRoots([...lock?.workspaceFolders ?? [], ...cwd !== void 0 ? [cwd] : []]);
+    this.workspaceRoots = uniqueRoots([...folders, ...this.cwd !== void 0 ? [this.cwd] : []]);
     this.snapshot = {
       ideName: lock?.ideName,
-      workspaceFolders: lock?.workspaceFolders ?? [],
+      workspaceFolders: folders,
       openedFiles: []
     };
     if (lock !== void 0) this.connect(lock);
@@ -296,21 +330,9 @@ var IdeBridge = class {
     this.ws?.close();
     this.ws = void 0;
   }
-  /** Re-evaluate the newest lock file; switch connections when it changed. */
+  /** Re-evaluate the selected lock file; switch connections when it changed. */
   rescan() {
-    if (this.disposed) return;
-    const lock = scanLatestLock(this.lockDir, this.logger);
-    const path = lock === void 0 ? void 0 : `${lock.port}.lock`;
-    if (path === this.lockPath) return;
-    this.lockPath = path;
-    this.knownTools = [];
-    this.workspaceRoots = uniqueRoots(lock?.workspaceFolders ?? []);
-    this.snapshot = {
-      ideName: lock?.ideName,
-      workspaceFolders: lock?.workspaceFolders ?? [],
-      openedFiles: []
-    };
-    if (lock !== void 0) this.connect(lock);
+    this.reselect();
   }
   /** Open (or re-open) the WebSocket + MCP session to one lock file. */
   connect(lock) {
@@ -356,8 +378,9 @@ var IdeBridge = class {
     this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, MAX_RECONNECT_DELAY_MS);
     setTimeout(() => {
       if (this.disposed) return;
-      const lock = scanLatestLock(this.lockDir, this.logger);
-      if (lock !== void 0) this.connect(lock);
+      const candidates = scanLocks(this.lockDir, this.logger) ?? [];
+      const selected = selectLockByWorkspace(candidates, this.cwd);
+      if (selected !== void 0) this.adoptLock(selected);
     }, delay);
   }
   /** Fire a JSON-RPC request; responses resolve via {@link handleMessage}. */

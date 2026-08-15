@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -8,6 +8,7 @@ import AgentRegistry, { agentEvents, Inbox, type Agent } from '@deepseek-ai/dsh-
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import * as ideContext from '@deepseek-ai/dsh-ide-context'
 import type { IdeSnapshot } from '@deepseek-ai/dsh-ide-context'
+import { IdeBridge } from '@deepseek-ai/dsh-ide-context'
 
 const SIGNAL = new AbortController().signal
 
@@ -131,6 +132,68 @@ describe('filterFilesUnderRoots', () => {
 
   it('keeps everything when roots is empty', () => {
     expect(ideContext.filterFilesUnderRoots(['/a', '/b'], [])).toEqual(['/a', '/b'])
+  })
+})
+
+describe('IdeBridge.followWorkspace rebuilding', () => {
+  let dir: string
+  let bridge: IdeBridge
+  afterEach(() => {
+    bridge?.dispose()
+    if (dir) rmSync(dir, { recursive: true, force: true })
+    vi.restoreAllMocks()
+  })
+
+  function lockFile(port: number, workspaceFolders: string[], mtimeAdvance = 0): void {
+    const content = {
+      pid: 1,
+      workspaceFolders,
+      ideName: 'Visual Studio Code',
+      authToken: `token-${port}`,
+    }
+    writeFileSync(join(dir, `${port}.lock`), JSON.stringify(content))
+    // Bump mtime so newest-first ordering is deterministic across rewrites.
+    const target = new Date(Date.now() + mtimeAdvance * 1000)
+    utimesSync(join(dir, `${port}.lock`), target, target)
+  }
+
+  it('rebuilds when the same port\'s workspaceFolders change (switch back to the project)', () => {
+    dir = mkdtempSync(join(tmpdir(), 'ide-context-'))
+    lockFile(65291, ['/Users/lsai/workspace/project-a'])
+    bridge = new IdeBridge(dir, 5000, quietLogger)
+    const connect = vi.spyOn(IdeBridge.prototype as never, 'connect' as never)
+
+    // Initial adoption for project A.
+    bridge.followWorkspace('/Users/lsai/workspace/project-a')
+    const firstCalls = connect.mock.calls.length
+
+    // Simulate the same VS Code window switching to project B: same port,
+    // different workspaceFolders content in the lock file.
+    lockFile(65291, ['/Users/lsai/workspace/project-b'], 1000)
+    bridge.followWorkspace('/Users/lsai/workspace/project-b')
+
+    // The bridge must re-adopt (reconnect) despite the port being unchanged.
+    expect(connect.mock.calls.length).toBeGreaterThan(firstCalls)
+
+    // Switch back to A with the same port again — must rebuild again.
+    lockFile(65291, ['/Users/lsai/workspace/project-a'], 2000)
+    const beforeReturn = connect.mock.calls.length
+    bridge.followWorkspace('/Users/lsai/workspace/project-a')
+    expect(connect.mock.calls.length).toBeGreaterThan(beforeReturn)
+  })
+
+  it('does not reconnect when the same port and folders are re-selected', () => {
+    dir = mkdtempSync(join(tmpdir(), 'ide-context-'))
+    lockFile(65291, ['/Users/lsai/workspace/project-a'])
+    bridge = new IdeBridge(dir, 5000, quietLogger)
+    const connect = vi.spyOn(IdeBridge.prototype as never, 'connect' as never)
+
+    bridge.followWorkspace('/Users/lsai/workspace/project-a')
+    const afterFirst = connect.mock.calls.length
+    bridge.followWorkspace('/Users/lsai/workspace/project-a')
+    bridge.followWorkspace('/Users/lsai/workspace/project-a')
+
+    expect(connect.mock.calls.length).toBe(afterFirst)
   })
 })
 
