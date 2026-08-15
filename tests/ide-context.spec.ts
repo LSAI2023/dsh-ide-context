@@ -208,6 +208,18 @@ describe('IdeBridge.followWorkspace rebuilding', () => {
     // ideName alone is connection metadata, not injectable context.
     expect(bridge.latest()).toBeUndefined()
   })
+
+  it('awaitLatest() resolves undefined when no substantive data arrives before the timeout', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'ide-context-'))
+    lockFile(65291, ['/Users/lsai/workspace/project-a'])
+    bridge = new IdeBridge(dir, 5000, quietLogger)
+    vi.spyOn(IdeBridge.prototype as never, 'connect' as never).mockImplementation(() => {})
+
+    bridge.followWorkspace('/Users/lsai/workspace/project-a')
+
+    const result = await bridge.awaitLatest(20)
+    expect(result).toBeUndefined()
+  })
 })
 
 // ---------------------------------------------------------------------------

@@ -450,15 +450,33 @@ export class IdeBridge {
    * Resolve to the latest snapshot, blocking up to `timeoutMs` for the first
    * substantive data to arrive. On a fresh connection the async handshake and
    * first poll have not returned yet when an eligible step fires; without this
-   * wait that first step would inject nothing. Returns `undefined` when no data
-   * arrives within the timeout.
+   * wait that first step would inject nothing. When opened files arrive before
+   * the selection (push-only IDEs like IntelliJ deliver `selection_changed`
+   * slightly later), it keeps waiting within the same timeout so the first step
+   * still carries the selection rather than a files-only snapshot. Returns
+   * `undefined` when nothing arrives within the timeout.
    */
   async awaitLatest(timeoutMs: number): Promise<IdeSnapshot | undefined> {
+    const deadline = Date.now() + timeoutMs
+    // First wait for any substantive data (opened files or selection).
+    const first = await this.waitForData(deadline)
+    if (first === undefined) return undefined
+    // Opened files landed but no selection yet: give a push-only selection a
+    // brief window to arrive, still bounded by the same deadline.
+    if (first.selection === undefined && Date.now() < deadline) {
+      await this.waitForData(deadline)
+    }
+    return this.latest()
+  }
+
+  /** Wait until substantive data arrives or `deadline` passes; resolve to the current snapshot. */
+  private waitForData(deadline: number): Promise<IdeSnapshot | undefined> {
     const immediate = this.latest()
-    if (immediate !== undefined) return immediate
-    if (this.disposed) return undefined
-    return await new Promise<IdeSnapshot | undefined>((resolve) => {
+    if (immediate !== undefined) return Promise.resolve(immediate)
+    if (this.disposed) return Promise.resolve(undefined)
+    return new Promise<IdeSnapshot | undefined>((resolve) => {
       let settled = false
+      const remaining = Math.max(0, deadline - Date.now())
       const done = (): void => {
         if (settled) return
         settled = true
@@ -467,7 +485,7 @@ export class IdeBridge {
         resolve(this.latest())
       }
       const onData = (): void => { done() }
-      const timer = setTimeout(done, timeoutMs)
+      const timer = setTimeout(done, remaining)
       this.readyWaiters.add(onData)
     })
   }
