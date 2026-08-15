@@ -6,3 +6,6 @@ node_modules/
 
 # Build temp
 *.tsbuildinfo
+
+# Lockfile (devDependencies only; runtime deps resolve from the harness)
+package-lock.json
