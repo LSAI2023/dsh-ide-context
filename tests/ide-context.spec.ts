@@ -300,15 +300,32 @@ describe('selection extraction', () => {
     })
   })
 
-  it('treats a missing selection as an empty caret selection', () => {
+  it('returns undefined when the selection is missing (no caret to report)', () => {
     const payload = JSON.stringify({ success: true, filePath: '/work/src/Main.java' })
     const result = { text: payload }
-    expect(ideContext.extractSelectionToolResult(result)).toEqual({
+    expect(ideContext.extractSelectionToolResult(result)).toBeUndefined()
+  })
+
+  it('returns undefined when VS Code reports an empty caret (isEmpty: true)', () => {
+    const payload = JSON.stringify({
+      success: true,
       filePath: '/work/src/Main.java',
-      start: { line: 0, character: 0 },
-      end: { line: 0, character: 0 },
+      selection: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 }, isEmpty: true },
       text: '',
     })
+    const result = { content: [{ type: 'text', text: payload }] }
+    expect(ideContext.extractSelectionToolResult(result)).toBeUndefined()
+  })
+
+  it('returns undefined for a (0,0)-(0,0) caret with no text', () => {
+    const payload = JSON.stringify({
+      success: true,
+      filePath: '/work/src/Main.java',
+      selection: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 }, isEmpty: false },
+      text: '',
+    })
+    const result = { content: [{ type: 'text', text: payload }] }
+    expect(ideContext.extractSelectionToolResult(result)).toBeUndefined()
   })
 })
 

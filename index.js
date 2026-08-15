@@ -169,16 +169,22 @@ function extractSelectionToolResult(result) {
   if (filePath === void 0) return void 0;
   const selection = data.selection;
   const selectedText = typeof data.text === "string" ? data.text : "";
-  if (selection === null || selection === void 0) {
-    return { filePath, start: { line: 0, character: 0 }, end: { line: 0, character: 0 }, text: selectedText };
-  }
+  if (selection === null || selection === void 0) return void 0;
+  if (selection.isEmpty === true) return void 0;
   const start = selection.start;
   const end = selection.end;
   if (start === void 0 || end === void 0) return void 0;
+  const startLine = Number(start.line) || 0;
+  const startChar = Number(start.character) || 0;
+  const endLine = Number(end.line) || 0;
+  const endChar = Number(end.character) || 0;
+  if (startLine === 0 && startChar === 0 && endLine === 0 && endChar === 0 && selectedText.length === 0) {
+    return void 0;
+  }
   return {
     filePath,
-    start: { line: Number(start.line) || 0, character: Number(start.character) || 0 },
-    end: { line: Number(end.line) || 0, character: Number(end.character) || 0 },
+    start: { line: startLine, character: startChar },
+    end: { line: endLine, character: endChar },
     text: selectedText
   };
 }
@@ -407,18 +413,21 @@ var IdeBridge = class {
   async awaitLatest(timeoutMs) {
     validatePositiveInteger(timeoutMs, "timeoutMs");
     const deadline = Date.now() + timeoutMs;
-    const first = await this.waitForData(deadline);
-    if (first === void 0) return void 0;
-    if (first.selection === void 0 && Date.now() < deadline) {
-      await this.waitForData(deadline);
+    const gotAny = await this.waitFor(() => this.latest() !== void 0, deadline);
+    if (!gotAny) return void 0;
+    if (this.snapshot.selection === void 0 && Date.now() < deadline) {
+      await this.waitFor(() => this.snapshot.selection !== void 0, deadline);
     }
     return this.latest();
   }
-  /** Wait until substantive data arrives or `deadline` passes; resolve to the current snapshot. */
-  waitForData(deadline) {
-    const immediate = this.latest();
-    if (immediate !== void 0) return Promise.resolve(immediate);
-    if (this.disposed) return Promise.resolve(void 0);
+  /**
+   * Wait until `predicate()` is true or `deadline` passes. Resolves `true` once
+   * the predicate holds, `false` on timeout/dispose. Wake-ups come from
+   * {@link notifyData}, which fires whenever files or selection change.
+   */
+  waitFor(predicate, deadline) {
+    if (predicate()) return Promise.resolve(true);
+    if (this.disposed) return Promise.resolve(false);
     return new Promise((resolve2) => {
       let settled = false;
       const remaining = Math.max(0, deadline - Date.now());
@@ -427,7 +436,7 @@ var IdeBridge = class {
         settled = true;
         this.readyWaiters.delete(onData);
         clearTimeout(timer);
-        resolve2(this.latest());
+        resolve2(predicate());
       };
       const onData = () => {
         done();

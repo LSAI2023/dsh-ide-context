@@ -29,7 +29,11 @@ export function extractOpenedFiles(result: unknown): string[] | undefined {
   return files.length > 0 ? files : undefined
 }
 
-/** Parse a selection out of a `getCurrentSelection`/`getLatestSelection` result. */
+/** Parse a selection out of a `getCurrentSelection`/`getLatestSelection` result.
+ * Returns `undefined` when there is no usable selection: VS Code reports an
+ * empty caret as `isEmpty: true` or a `(0,0)-(0,0)` range, which must not be
+ * treated as "a selection is present" — doing so would make the bridge settle
+ * for a files-only snapshot and miss a selection that arrives a beat later. */
 export function extractSelectionToolResult(result: unknown): IdeSelection | undefined {
   const text = extractToolText(result)
   if (text === undefined) return undefined
@@ -41,18 +45,27 @@ export function extractSelectionToolResult(result: unknown): IdeSelection | unde
   }
   const filePath = typeof data.filePath === 'string' ? data.filePath : undefined
   if (filePath === undefined) return undefined
-  const selection = data.selection as { start?: unknown; end?: unknown } | null | undefined
+  const selection = data.selection as { start?: unknown; end?: unknown; isEmpty?: unknown } | null | undefined
   const selectedText = typeof data.text === 'string' ? data.text : ''
-  if (selection === null || selection === undefined) {
-    return { filePath, start: { line: 0, character: 0 }, end: { line: 0, character: 0 }, text: selectedText }
-  }
+  // No selection object (VS Code 'isEmpty' caret) => no usable selection.
+  if (selection === null || selection === undefined) return undefined
+  // Explicit empty marker from VS Code => no usable selection.
+  if (selection.isEmpty === true) return undefined
   const start = selection.start as { line?: unknown; character?: unknown } | undefined
   const end = selection.end as { line?: unknown; character?: unknown } | undefined
   if (start === undefined || end === undefined) return undefined
+  const startLine = Number(start.line) || 0
+  const startChar = Number(start.character) || 0
+  const endLine = Number(end.line) || 0
+  const endChar = Number(end.character) || 0
+  // An empty caret at (0,0)-(0,0) with no text is not a selection.
+  if (startLine === 0 && startChar === 0 && endLine === 0 && endChar === 0 && selectedText.length === 0) {
+    return undefined
+  }
   return {
     filePath,
-    start: { line: Number(start.line) || 0, character: Number(start.character) || 0 },
-    end: { line: Number(end.line) || 0, character: Number(end.character) || 0 },
+    start: { line: startLine, character: startChar },
+    end: { line: endLine, character: endChar },
     text: selectedText,
   }
 }

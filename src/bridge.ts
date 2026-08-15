@@ -90,20 +90,27 @@ export class IdeBridge {
   async awaitLatest(timeoutMs: number): Promise<IdeSnapshot | undefined> {
     validatePositiveInteger(timeoutMs, 'timeoutMs')
     const deadline = Date.now() + timeoutMs
-    const first = await this.waitForData(deadline)
-    if (first === undefined) return undefined
-    if (first.selection === undefined && Date.now() < deadline) {
-      await this.waitForData(deadline)
+    // Phase 1: wait for ANY substantive data (opened files or selection).
+    const gotAny = await this.waitFor(() => this.latest() !== undefined, deadline)
+    if (!gotAny) return undefined
+    // Phase 2: opened files landed but selection is still missing — keep waiting
+    // for the selection specifically (not just "any data", which latest() already
+    // satisfies once files are present).
+    if (this.snapshot.selection === undefined && Date.now() < deadline) {
+      await this.waitFor(() => this.snapshot.selection !== undefined, deadline)
     }
     return this.latest()
   }
 
-  /** Wait until substantive data arrives or `deadline` passes; resolve to the current snapshot. */
-  private waitForData(deadline: number): Promise<IdeSnapshot | undefined> {
-    const immediate = this.latest()
-    if (immediate !== undefined) return Promise.resolve(immediate)
-    if (this.disposed) return Promise.resolve(undefined)
-    return new Promise<IdeSnapshot | undefined>((resolve) => {
+  /**
+   * Wait until `predicate()` is true or `deadline` passes. Resolves `true` once
+   * the predicate holds, `false` on timeout/dispose. Wake-ups come from
+   * {@link notifyData}, which fires whenever files or selection change.
+   */
+  private waitFor(predicate: () => boolean, deadline: number): Promise<boolean> {
+    if (predicate()) return Promise.resolve(true)
+    if (this.disposed) return Promise.resolve(false)
+    return new Promise<boolean>((resolve) => {
       let settled = false
       const remaining = Math.max(0, deadline - Date.now())
       const done = (): void => {
@@ -111,7 +118,7 @@ export class IdeBridge {
         settled = true
         this.readyWaiters.delete(onData)
         clearTimeout(timer)
-        resolve(this.latest())
+        resolve(predicate())
       }
       const onData = (): void => { done() }
       const timer = setTimeout(done, remaining)
