@@ -16,6 +16,7 @@
   ],
   "scripts": {
     "build": "node build.mjs",
+    "check:build": "node check-build.mjs",
     "test": "node smoke-test.mjs"
   },
   "license": "MIT",

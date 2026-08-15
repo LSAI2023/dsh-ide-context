@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+# Pre-commit: fail when index.js/invariant.js are stale relative to src/.
+# The plugin ships compiled JS (see check-build.mjs); a drifted artifact would
+# publish the previous implementation.
+node check-build.mjs
