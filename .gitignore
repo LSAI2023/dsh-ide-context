@@ -1,0 +1,8 @@
+# Dependencies (devDependencies install here; runtime @deepseek-ai/* resolve from the harness)
+node_modules/
+
+# macOS
+.DS_Store
+
+# Build temp
+*.tsbuildinfo

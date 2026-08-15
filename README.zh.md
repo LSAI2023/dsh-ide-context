@@ -59,10 +59,25 @@ This may or may not be related to the current task.
 
 ## 注意事项
 
-- **工作区匹配** —— 桥优先选择 `workspaceFolders` 精确包含当前会话工作目录的那个 IDE，都不匹配时回退到最新的 lock。IntelliJ 与 VS Code 同时打开时，以你启动 dsh 所在的项目为准。
+- **工作区匹配** —— 桥优先选择 `workspaceFolders` 包含当前会话工作目录（精确或父目录）的那个 IDE，都不匹配时回退到最新的 lock。IntelliJ 与 VS Code 同时打开时，以你启动 dsh 所在的项目为准。
+- **按项目范围过滤** —— 打开的文件与选区会过滤到会话工作目录及匹配到的 IDE 的 `workspaceFolders` 之下；无关项目的文件以及虚拟文档（`git:`、`output:` 等）会被丢弃，只返回当前项目的上下文。
 - **IntelliJ 选区是推送式** —— 插件连接之前做出的选区不会回填；VS Code 额外支持轮询。
 - 运行时 peer 依赖 `@deepseek-ai/dsh-llm` 与依赖 `@deepseek-ai/schemastery` 从 DeepSeek Harness 安装中解析。
 
+## 开发
+
+本仓库自包含：TypeScript 源码位于 `src/`，用 esbuild 构建到发布的 `index.js`（以及 `invariant.js`）。
+
+```sh
+npm install         # devDependencies（esbuild、typescript、@types/node）
+npm run build       # 将 src/index.ts 与 src/invariant.ts 打包为 index.js / invariant.js
+npm test            # 针对本地假 IDE 桥的实时 MCP-over-WebSocket 冒烟测试
+```
+
+构建会把 `@deepseek-ai/*` 与 `node:*` 保持为外部依赖，因此运行时依赖仍从 DeepSeek Harness 安装中解析，与之前一致。
+
 ## 源码
 
-`index.js` 是编译后的插件入口。TypeScript 源码及其测试套件位于 DeepSeek Harness 仓库的 `packages/context/ide-context/`。
+- `src/index.ts` —— 插件入口（打开文件 + 选区桥、lock 发现、变更抑制注入）。
+- `src/invariant.ts` —— 包自有的 invariant 伴生插件（以 `@deepseek-ai/dsh-ide-context/invariant` 注册）。
+- `tests/ide-context.spec.ts` —— 从 DeepSeek Harness 仓库 `packages/context/ide-context/` 移植的单元测试。

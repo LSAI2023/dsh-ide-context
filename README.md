@@ -59,10 +59,25 @@ The selection block uses Claude Code's editor-selection structure: a 1-based inc
 
 ## Notes
 
-- **Workspace matching** — the bridge prefers the IDE whose `workspaceFolders` exactly contains the session's working directory, then falls back to the newest lock. With both IntelliJ and VS Code open, the project you launched dsh from wins.
+- **Workspace matching** — the bridge prefers the IDE whose `workspaceFolders` contains the session's working directory (exact or a parent directory), then falls back to the newest lock. With both IntelliJ and VS Code open, the project you launched dsh from wins.
+- **Project-scoped results** — opened files and the selection are filtered to the session's working directory and the matched IDE's `workspaceFolders`; files from unrelated projects and virtual documents (`git:`, `output:`, …) are dropped so only the current project's context is returned.
 - **IntelliJ selection is push-based** — a selection made before the plugin connected is not backfilled; VS Code additionally supports polling.
 - The runtime peer dependency `@deepseek-ai/dsh-llm` and dependency `@deepseek-ai/schemastery` resolve from the DeepSeek Harness installation.
 
+## Development
+
+This repository is self-contained: the TypeScript source lives in `src/` and builds to the published `index.js` (and `invariant.js`) with esbuild.
+
+```sh
+npm install         # devDependencies (esbuild, typescript, @types/node)
+npm run build       # bundle src/index.ts and src/invariant.ts -> index.js / invariant.js
+npm test            # live MCP-over-WebSocket smoke test against a local fake IDE bridge
+```
+
+The build keeps `@deepseek-ai/*` and `node:*` external, so the runtime dependencies resolve from the DeepSeek Harness installation exactly as before.
+
 ## Source
 
-`index.js` is the transpiled plugin entry. The TypeScript source and its test suite live in the DeepSeek Harness repository under `packages/context/ide-context/`.
+- `src/index.ts` — the plugin entry (opened-files + selection bridge, lock discovery, change-suppressed injection).
+- `src/invariant.ts` — the package-owned invariant companion (registered as `@deepseek-ai/dsh-ide-context/invariant`).
+- `tests/ide-context.spec.ts` — unit tests ported from the DeepSeek Harness repository's `packages/context/ide-context/`.

@@ -1,7 +1,7 @@
-# dsh-ide-context bundle layer: mounts the ide-context plugin with its defaults.
+# @deepseek-ai/dsh-ide-context bundle layer: mounts the ide-context plugin with its defaults.
 # Users override any key in their profile's own cordis.patch.yml, which applies
 # after every bundle layer and wins per row.
 
 - insert:
     - id: ide-context
-      name: 'dsh-ide-context'
+      name: '@deepseek-ai/dsh-ide-context'
