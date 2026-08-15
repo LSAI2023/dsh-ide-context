@@ -9,10 +9,6 @@
 ## 安装
 
 ```sh
-# 从 npm 安装
-dsh plugin add dsh-ide-context
-
-# 或直接从 git 仓库安装
 dsh plugin add github:LSAI2023/dsh-ide-context
 ```
 

@@ -9,10 +9,6 @@ It reads the **Claude Code IDE integration** bridge — the same `~/.claude/ide/
 ## Install
 
 ```sh
-# from npm
-dsh plugin add dsh-ide-context
-
-# or straight from a git host
 dsh plugin add github:LSAI2023/dsh-ide-context
 ```
 
