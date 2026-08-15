@@ -18,6 +18,7 @@ var LOCK_SCAN_INTERVAL_MS = 2e3;
 var MAX_RECONNECT_DELAY_MS = 3e4;
 var PROTOCOL_VERSION = "2024-11-05";
 var WS_SUBPROTOCOL = "mcp";
+var DATA_READY_TIMEOUT_MS = 1500;
 var READING_PREFIX = "ide context (turn ";
 var RawWs = class {
   constructor(url, headers) {
@@ -251,6 +252,8 @@ var IdeBridge = class {
   pollTimer;
   reconnectDelayMs = 500;
   disposed = false;
+  /** Waiters blocking `awaitLatest` until substantive data (files/selection) arrives. */
+  readyWaiters = /* @__PURE__ */ new Set();
   /**
    * Latest IDE snapshot, or `undefined` before any substantive data arrived.
    * `ideName` alone is connection metadata, not context: it is written as soon
@@ -264,6 +267,40 @@ var IdeBridge = class {
       return void 0;
     }
     return snapshot;
+  }
+  /**
+   * Resolve to the latest snapshot, blocking up to `timeoutMs` for the first
+   * substantive data to arrive. On a fresh connection the async handshake and
+   * first poll have not returned yet when an eligible step fires; without this
+   * wait that first step would inject nothing. Returns `undefined` when no data
+   * arrives within the timeout.
+   */
+  async awaitLatest(timeoutMs) {
+    const immediate = this.latest();
+    if (immediate !== void 0) return immediate;
+    if (this.disposed) return void 0;
+    return await new Promise((resolve2) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        this.readyWaiters.delete(onData);
+        clearTimeout(timer);
+        resolve2(this.latest());
+      };
+      const onData = () => {
+        done();
+      };
+      const timer = setTimeout(done, timeoutMs);
+      this.readyWaiters.add(onData);
+    });
+  }
+  /** Wake any {@link awaitLatest} waiters once files/selection have arrived. */
+  notifyData() {
+    const { snapshot } = this;
+    if (snapshot.openedFiles.length === 0 && snapshot.selection === void 0) return;
+    for (const waiter of this.readyWaiters) waiter();
+    this.readyWaiters.clear();
   }
   /**
    * Re-select the lock by a session working directory: prefer a lock whose
@@ -433,6 +470,7 @@ var IdeBridge = class {
     if (!this.isInWorkspace(filePath)) return;
     if (selection === null || selection === void 0) {
       this.snapshot.selection = { filePath, start: { line: 0, character: 0 }, end: { line: 0, character: 0 }, text };
+      this.notifyData();
       return;
     }
     const start = selection.start;
@@ -444,6 +482,7 @@ var IdeBridge = class {
       end: { line: Number(end.line) || 0, character: Number(end.character) || 0 },
       text
     };
+    this.notifyData();
   }
   /** Periodically refresh opened files and (where exposed) the selection. */
   poll() {
@@ -456,7 +495,10 @@ var IdeBridge = class {
     if (tool === void 0) return;
     const result = await this.rpc("tools/call", { name: tool, arguments: {} });
     const files = extractOpenedFiles(result);
-    if (files !== void 0) this.snapshot.openedFiles = filterFilesUnderRoots(files, this.workspaceRoots);
+    if (files !== void 0) {
+      this.snapshot.openedFiles = filterFilesUnderRoots(files, this.workspaceRoots);
+      this.notifyData();
+    }
   }
   async refreshSelection() {
     const tool = SELECTION_TOOLS.find((candidate) => this.knownTools.includes(candidate));
@@ -466,6 +508,7 @@ var IdeBridge = class {
     if (selection === void 0) return;
     if (!this.isInWorkspace(selection.filePath)) return;
     this.snapshot.selection = selection;
+    this.notifyData();
   }
   /** True when `path` belongs under one of the current workspace roots (no roots = accept). */
   isInWorkspace(path) {
@@ -593,6 +636,10 @@ function renderReading(snapshot, turn) {
   return `${READING_PREFIX}${turn}):
 ${renderState(snapshot)}`;
 }
+async function readSnapshot(bridge, timeoutMs) {
+  if (typeof bridge.awaitLatest === "function") return await bridge.awaitLatest(timeoutMs);
+  return bridge.latest();
+}
 function latestInjectedState(agent) {
   for (const event of [...agent.session.events].reverse()) {
     if (event.type === "user/message" && event.data.source.kind === "plugin" && event.data.source.plugin === name) {
@@ -635,7 +682,7 @@ function apply(ctx, config) {
       const now = Date.now();
       if (now >= previous.time && now - previous.time < refreshIntervalMs) return decision;
     }
-    const snapshot = bridge.latest();
+    const snapshot = await readSnapshot(bridge, DATA_READY_TIMEOUT_MS);
     if (snapshot === void 0) return decision;
     const state = renderState(snapshot);
     if (state.length === 0) return decision;

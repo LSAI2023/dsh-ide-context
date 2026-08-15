@@ -348,7 +348,11 @@ describe('rendering', () => {
 // agent/pre-step injection
 // ---------------------------------------------------------------------------
 
-type IdeContextStub = { latest: () => IdeSnapshot | undefined; followWorkspace: (cwd: string | undefined) => void }
+type IdeContextStub = {
+  latest: () => IdeSnapshot | undefined
+  followWorkspace: (cwd: string | undefined) => void
+  awaitLatest?: (timeoutMs: number) => Promise<IdeSnapshot | undefined>
+}
 
 function sessionAgent(session: Session, id = 'agent'): Agent {
   return {
@@ -502,5 +506,31 @@ describe('ide-context injection', () => {
     await fire(ctx, sessionAgent(session), 1, 1)
 
     expect(contextTexts(session)).toHaveLength(0)
+  })
+
+  it('waits for the first poll via awaitLatest instead of missing the first step', async () => {
+    const snap = snapshot()
+    const ctx = new Context()
+    await ctx.plugin(AgentRegistry)
+    let resolved = false
+    const stub: IdeContextStub = {
+      latest: () => (resolved ? snap : undefined),
+      followWorkspace: () => {},
+      awaitLatest: async () => {
+        await new Promise(r => { setTimeout(r, 10) })
+        resolved = true
+        return snap
+      },
+    }
+    ctx.provide('ideContext', stub as never)
+    await ctx.plugin(ideContext, {})
+    const session = Session.create(SessionId('await-first'))
+    openMessageTurn(session, 1)
+
+    await fire(ctx, sessionAgent(session), 1, 1)
+
+    const texts = contextTexts(session)
+    expect(texts).toHaveLength(1)
+    expect(texts[0]).toContain('- /work/project/src/Main.java')
   })
 })

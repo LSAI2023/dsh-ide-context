@@ -76,6 +76,8 @@ const MAX_RECONNECT_DELAY_MS = 30_000
 const PROTOCOL_VERSION = '2024-11-05'
 /** MCP subprotocol required by the Ktor/extension WebSocket servers. */
 const WS_SUBPROTOCOL = 'mcp'
+/** How long an eligible step waits for the first IDE poll before injecting nothing. */
+const DATA_READY_TIMEOUT_MS = 1_500
 
 /** A zero-based IDE position (IntelliJ LogicalPosition / VS Code Position). */
 export interface IdePosition {
@@ -420,6 +422,8 @@ export class IdeBridge {
   private pollTimer: NodeJS.Timeout | undefined
   private reconnectDelayMs = 500
   private disposed = false
+  /** Waiters blocking `awaitLatest` until substantive data (files/selection) arrives. */
+  private readonly readyWaiters = new Set<() => void>()
 
   constructor(
     private readonly lockDir: string,
@@ -440,6 +444,40 @@ export class IdeBridge {
       return undefined
     }
     return snapshot
+  }
+
+  /**
+   * Resolve to the latest snapshot, blocking up to `timeoutMs` for the first
+   * substantive data to arrive. On a fresh connection the async handshake and
+   * first poll have not returned yet when an eligible step fires; without this
+   * wait that first step would inject nothing. Returns `undefined` when no data
+   * arrives within the timeout.
+   */
+  async awaitLatest(timeoutMs: number): Promise<IdeSnapshot | undefined> {
+    const immediate = this.latest()
+    if (immediate !== undefined) return immediate
+    if (this.disposed) return undefined
+    return await new Promise<IdeSnapshot | undefined>((resolve) => {
+      let settled = false
+      const done = (): void => {
+        if (settled) return
+        settled = true
+        this.readyWaiters.delete(onData)
+        clearTimeout(timer)
+        resolve(this.latest())
+      }
+      const onData = (): void => { done() }
+      const timer = setTimeout(done, timeoutMs)
+      this.readyWaiters.add(onData)
+    })
+  }
+
+  /** Wake any {@link awaitLatest} waiters once files/selection have arrived. */
+  private notifyData(): void {
+    const { snapshot } = this
+    if (snapshot.openedFiles.length === 0 && snapshot.selection === undefined) return
+    for (const waiter of this.readyWaiters) waiter()
+    this.readyWaiters.clear()
   }
 
   /**
@@ -619,6 +657,7 @@ export class IdeBridge {
     if (!this.isInWorkspace(filePath)) return
     if (selection === null || selection === undefined) {
       this.snapshot.selection = { filePath, start: { line: 0, character: 0 }, end: { line: 0, character: 0 }, text }
+      this.notifyData()
       return
     }
     const start = selection.start as { line?: unknown; character?: unknown } | undefined
@@ -630,6 +669,7 @@ export class IdeBridge {
       end: { line: Number(end.line) || 0, character: Number(end.character) || 0 },
       text,
     }
+    this.notifyData()
   }
 
   /** Periodically refresh opened files and (where exposed) the selection. */
@@ -644,7 +684,10 @@ export class IdeBridge {
     if (tool === undefined) return
     const result = await this.rpc('tools/call', { name: tool, arguments: {} })
     const files = extractOpenedFiles(result)
-    if (files !== undefined) this.snapshot.openedFiles = filterFilesUnderRoots(files, this.workspaceRoots)
+    if (files !== undefined) {
+      this.snapshot.openedFiles = filterFilesUnderRoots(files, this.workspaceRoots)
+      this.notifyData()
+    }
   }
 
   private async refreshSelection(): Promise<void> {
@@ -656,6 +699,7 @@ export class IdeBridge {
     // A selection in a file outside the current project is not this project's context.
     if (!this.isInWorkspace(selection.filePath)) return
     this.snapshot.selection = selection
+    this.notifyData()
   }
 
   /** True when `path` belongs under one of the current workspace roots (no roots = accept). */
@@ -839,6 +883,16 @@ function renderReading(snapshot: IdeSnapshot, turn: number): string {
 }
 
 /**
+ * Read the latest snapshot, waiting briefly for the first poll when the bridge
+ * supports it. Tests inject a minimal `{ latest, followWorkspace }` stub without
+ * `awaitLatest`, so fall back to the synchronous read in that case.
+ */
+async function readSnapshot(bridge: IdeBridge, timeoutMs: number): Promise<IdeSnapshot | undefined> {
+  if (typeof bridge.awaitLatest === 'function') return await bridge.awaitLatest(timeoutMs)
+  return bridge.latest()
+}
+
+/**
  * The stable state block of this plugin's latest durable injection, or
  * `undefined` when the session has none. Scans raw durable events so the
  * schedule survives compaction and resumed processes without process-local
@@ -900,7 +954,7 @@ export function apply(ctx: Context, config: Config): void {
       const now = Date.now()
       if (now >= previous.time && now - previous.time < refreshIntervalMs) return decision
     }
-    const snapshot = bridge.latest()
+    const snapshot = await readSnapshot(bridge, DATA_READY_TIMEOUT_MS)
     if (snapshot === undefined) return decision
     const state = renderState(snapshot)
     if (state.length === 0) return decision
