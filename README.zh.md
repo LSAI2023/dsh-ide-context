@@ -76,8 +76,20 @@ npm test            # 针对本地假 IDE 桥的实时 MCP-over-WebSocket 冒烟
 
 构建会把 `@deepseek-ai/*` 与 `node:*` 保持为外部依赖，因此运行时依赖仍从 DeepSeek Harness 安装中解析，与之前一致。
 
+> `index.js` 与 `invariant.js` 是已提交的构建产物：本包直接从 GitHub 以编译后的 JS 形式被消费，因此必须与 `src/` 保持同步。修改 `src/` 后请运行 `npm run build`（或 `npm run check:build`，它会重新构建并在产物漂移时报错）。执行一次 `node install-hooks.mjs` 可启用 pre-commit 检查，CI 亦执行同样的校验。
+
 ## 源码
 
-- `src/index.ts` —— 插件入口（打开文件 + 选区桥、lock 发现、变更抑制注入）。
+实现已按职责拆分为 `src/` 下的多个模块：
+
+- `src/index.ts` —— 装配入口：re-export 公共 API 并挂载 pre-step 监听器。
+- `src/types.ts` —— 领域模型（`IdeSnapshot`、`IdeSelection`）与配置 schema。
+- `src/constants.ts` —— 共享名称、默认值与可调参数。
+- `src/platform.ts` —— 路径/URI 处理，置于 `Platform` 抽象之后（为 Windows 预留）。
+- `src/lock.ts` —— 锁文件发现与工作区选择。
+- `src/ws.ts` —— 零依赖 RFC 6455 WebSocket 客户端。
+- `src/protocol.ts` —— MCP 工具结果解析。
+- `src/bridge.ts` —— 连接生命周期 + 快照维护（`IdeBridge`）。
+- `src/format.ts` —— 快照渲染，置于 `SelectionRenderStrategy` 之后。
 - `src/invariant.ts` —— 包自有的 invariant 伴生插件（以 `@deepseek-ai/dsh-ide-context/invariant` 注册）。
 - `tests/ide-context.spec.ts` —— 从 DeepSeek Harness 仓库 `packages/context/ide-context/` 移植的单元测试。

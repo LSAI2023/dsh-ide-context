@@ -76,8 +76,20 @@ npm test            # live MCP-over-WebSocket smoke test against a local fake ID
 
 The build keeps `@deepseek-ai/*` and `node:*` external, so the runtime dependencies resolve from the DeepSeek Harness installation exactly as before.
 
+> `index.js` and `invariant.js` are committed build artifacts: the package is consumed directly from GitHub as compiled JS, so they must stay in sync with `src/`. After editing `src/`, run `npm run build` (or `npm run check:build` to rebuild and fail if the artifacts drift). A one-time `node install-hooks.mjs` enables a pre-commit check, and CI enforces the same guard.
+
 ## Source
 
-- `src/index.ts` — the plugin entry (opened-files + selection bridge, lock discovery, change-suppressed injection).
+The implementation is split into focused modules under `src/`:
+
+- `src/index.ts` — assembly entry point: re-exports the public API and wires the pre-step listener.
+- `src/types.ts` — domain model (`IdeSnapshot`, `IdeSelection`) and configuration schema.
+- `src/constants.ts` — shared names, defaults, and tunables.
+- `src/platform.ts` — path/URI handling behind a `Platform` seam (Windows-ready).
+- `src/lock.ts` — lock-file discovery and workspace selection.
+- `src/ws.ts` — zero-dependency RFC 6455 WebSocket client.
+- `src/protocol.ts` — MCP tool-result parsing.
+- `src/bridge.ts` — connection lifecycle + snapshot maintenance (`IdeBridge`).
+- `src/format.ts` — snapshot rendering behind a `SelectionRenderStrategy`.
 - `src/invariant.ts` — the package-owned invariant companion (registered as `@deepseek-ai/dsh-ide-context/invariant`).
 - `tests/ide-context.spec.ts` — unit tests ported from the DeepSeek Harness repository's `packages/context/ide-context/`.
