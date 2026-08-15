@@ -1,18 +1,11 @@
 // src/index.ts
-import z from "@deepseek-ai/schemastery";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+
+// src/constants.ts
 import { homedir } from "node:os";
-import { join, resolve, sep } from "node:path";
-import http from "node:http";
-import crypto from "node:crypto";
+import { join } from "node:path";
 var name = "ide-context";
 var inject = ["agents"];
-var Config = z.object({
-  refreshIntervalMs: z.number(),
-  pollIntervalMs: z.number(),
-  lockDir: z.string()
-});
 var DEFAULT_LOCK_DIR = join(homedir(), ".claude", "ide");
 var LOCK_SCAN_INTERVAL_MS = 2e3;
 var MAX_RECONNECT_DELAY_MS = 3e4;
@@ -20,20 +13,239 @@ var PROTOCOL_VERSION = "2024-11-05";
 var WS_SUBPROTOCOL = "mcp";
 var DATA_READY_TIMEOUT_MS = 1500;
 var READING_PREFIX = "ide context (turn ";
+var OPENED_FILES_TOOLS = ["get_all_opened_file_paths", "getOpenEditors"];
+var SELECTION_TOOLS = ["getCurrentSelection", "getLatestSelection"];
+
+// src/lock.ts
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join as join2 } from "node:path";
+
+// src/platform.ts
+import { resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
+var SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
+var platform;
+var posix = {
+  normalizePath: resolve,
+  separator: sep,
+  isWithinRoot(path, root) {
+    const p = posix.normalizePath(path);
+    const r = posix.normalizePath(root);
+    if (p === r) return true;
+    return p.startsWith(`${r}${posix.separator}`);
+  },
+  fileUriToPath(uri) {
+    if (!SCHEME_RE.test(uri)) return uri;
+    if (!uri.startsWith("file://")) return void 0;
+    const rest = uri.slice("file://".length);
+    try {
+      return fileURLToPath(uri);
+    } catch {
+      return decodeURIComponentFallback(rest);
+    }
+  },
+  isDiskPath(path) {
+    return SCHEME_RE.test(path) ? path.startsWith("file://") : true;
+  }
+};
+function currentPlatform() {
+  return platform ??= posix;
+}
+function decodeURIComponentFallback(rest) {
+  try {
+    return decodeURIComponent(rest);
+  } catch {
+    return rest;
+  }
+}
+function isWithinRoot(path, root) {
+  return currentPlatform().isWithinRoot(path, root);
+}
+function fileUriToPath(uri) {
+  return currentPlatform().fileUriToPath(uri);
+}
+function isDiskPath(path) {
+  return currentPlatform().isDiskPath(path);
+}
+
+// src/lock.ts
+function scanLocks(lockDir, logger) {
+  let entries;
+  try {
+    entries = readdirSync(lockDir);
+  } catch (error) {
+    logger.warn(`ide-context: cannot read lock directory ${lockDir}: ${error instanceof Error ? error.message : String(error)}`);
+    return void 0;
+  }
+  const candidates = [];
+  for (const entry of entries.sort()) {
+    if (!entry.endsWith(".lock")) continue;
+    const path = join2(lockDir, entry);
+    let mtime;
+    try {
+      mtime = statSync(path).mtimeMs;
+    } catch {
+      continue;
+    }
+    const fileName = path.split(/[\\/]/).pop();
+    if (fileName === void 0) continue;
+    const port = Number(fileName.replace(".lock", ""));
+    if (!Number.isInteger(port) || port <= 0) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync(path, "utf8"));
+    } catch (error) {
+      logger.warn(`ide-context: unreadable lock file ${path}: ${error instanceof Error ? error.message : String(error)}`);
+      continue;
+    }
+    const root = parsed;
+    if (typeof root.authToken !== "string" || root.authToken.length === 0) continue;
+    const folders = Array.isArray(root.workspaceFolders) ? root.workspaceFolders.filter((item) => typeof item === "string") : [];
+    candidates.push({
+      path,
+      mtime,
+      lock: {
+        port,
+        ideName: typeof root.ideName === "string" ? root.ideName : void 0,
+        pid: typeof root.pid === "number" ? root.pid : void 0,
+        workspaceFolders: folders,
+        authToken: root.authToken
+      }
+    });
+  }
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  return candidates;
+}
+function scanLatestLock(lockDir, logger) {
+  return scanLocks(lockDir, logger)?.[0]?.lock;
+}
+function selectLockByWorkspace(candidates, cwd) {
+  if (cwd !== void 0) {
+    let best;
+    for (const candidate of candidates) {
+      if (!candidate.lock.workspaceFolders.some((folder) => isWithinRoot(cwd, folder))) continue;
+      if (best === void 0 || candidate.mtime > best.mtime) best = candidate;
+    }
+    if (best !== void 0) return best;
+  }
+  return candidates[0];
+}
+function filterFilesUnderRoots(files, roots) {
+  if (roots.length === 0) return files;
+  return files.filter((file) => roots.some((root) => isWithinRoot(file, root)));
+}
+function uniqueRoots(roots) {
+  const out = [];
+  for (const root of roots) {
+    if (root.length === 0) continue;
+    if (out.some((existing) => isWithinRoot(root, existing))) continue;
+    out.push(root);
+  }
+  return out;
+}
+
+// src/protocol.ts
+function extractOpenedFiles(result) {
+  const content = extractToolText(result);
+  if (content === void 0) return void 0;
+  const trimmed = content.trim();
+  const parsed = parseJson(trimmed);
+  if (parsed !== null && typeof parsed === "object") {
+    return extractFilePaths(parsed);
+  }
+  const files = trimmed.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0 && !line.startsWith("[") && !line.startsWith("{"));
+  return files.length > 0 ? files : void 0;
+}
+function extractSelectionToolResult(result) {
+  const text = extractToolText(result);
+  if (text === void 0) return void 0;
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return void 0;
+  }
+  const filePath = typeof data.filePath === "string" ? data.filePath : void 0;
+  if (filePath === void 0) return void 0;
+  const selection = data.selection;
+  const selectedText = typeof data.text === "string" ? data.text : "";
+  if (selection === null || selection === void 0) {
+    return { filePath, start: { line: 0, character: 0 }, end: { line: 0, character: 0 }, text: selectedText };
+  }
+  const start = selection.start;
+  const end = selection.end;
+  if (start === void 0 || end === void 0) return void 0;
+  return {
+    filePath,
+    start: { line: Number(start.line) || 0, character: Number(start.character) || 0 },
+    end: { line: Number(end.line) || 0, character: Number(end.character) || 0 },
+    text: selectedText
+  };
+}
+function extractToolText(result) {
+  if (result === null || typeof result !== "object") return void 0;
+  const content = result.content;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (typeof block === "object" && block !== null && block.type === "text" && typeof block.text === "string") {
+        return block.text;
+      }
+    }
+    return void 0;
+  }
+  const text = result.text;
+  return typeof text === "string" ? text : void 0;
+}
+function parseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return void 0;
+  }
+}
+function extractFilePaths(parsed) {
+  const items = Array.isArray(parsed) ? parsed : parsed !== null && typeof parsed === "object" && Array.isArray(parsed.tabs) ? parsed.tabs : void 0;
+  if (items === void 0) return [];
+  return items.map((item) => itemFilePath(item)).filter((file) => typeof file === "string" && file.length > 0);
+}
+function itemFilePath(item) {
+  if (typeof item === "string") return fileUriToPath(item);
+  if (item === null || typeof item !== "object") return void 0;
+  const record = item;
+  if (typeof record.fileName === "string" && isDiskPath(record.fileName)) return record.fileName;
+  if (typeof record.path === "string" && isDiskPath(record.path)) return record.path;
+  if (typeof record.uri === "string") return fileUriToPath(record.uri);
+  return void 0;
+}
+
+// src/types.ts
+import z from "@deepseek-ai/schemastery";
+var Config = z.object({
+  refreshIntervalMs: z.number(),
+  pollIntervalMs: z.number(),
+  lockDir: z.string()
+});
+function validatePositiveInteger(value, field) {
+  if (value !== void 0 && (!Number.isSafeInteger(value) || value < 0)) {
+    throw new TypeError(`ide-context: ${field} must be a non-negative safe integer, got ${String(value)}`);
+  }
+}
+
+// src/ws.ts
+import crypto from "node:crypto";
+import http from "node:http";
 var RawWs = class {
-  constructor(url, headers) {
+  constructor(url, headers, callbacks = {}) {
     this.url = url;
     this.headers = headers;
+    this.callbacks = callbacks;
   }
   url;
   headers;
+  callbacks;
   socket;
   buffer = Buffer.alloc(0);
   closed = false;
-  onopen;
-  onmessage;
-  onclose;
-  onerror;
   /** Open the WebSocket connection (RFC 6455 handshake). */
   connect() {
     const u = new URL(this.url);
@@ -60,17 +272,17 @@ var RawWs = class {
       socket.on("close", () => {
         if (!this.closed) {
           this.closed = true;
-          this.onclose?.(1006, "socket closed");
+          this.callbacks.onclose?.(1006, "socket closed");
         }
       });
-      socket.on("error", (error) => this.onerror?.(error));
-      this.onopen?.();
+      socket.on("error", (error) => this.callbacks.onerror?.(error));
+      this.callbacks.onopen?.();
     });
     req.on("response", (res) => {
-      this.onerror?.(new Error(`handshake rejected: HTTP ${res.statusCode}`));
+      this.callbacks.onerror?.(new Error(`handshake rejected: HTTP ${res.statusCode}`));
       res.resume();
     });
-    req.on("error", (error) => this.onerror?.(error));
+    req.on("error", (error) => this.callbacks.onerror?.(error));
     req.end();
   }
   /** Send one masked text frame. */
@@ -124,7 +336,7 @@ var RawWs = class {
       const payload = this.buffer.subarray(offset, offset + length);
       this.buffer = this.buffer.subarray(offset + length);
       if (opcode === 1) {
-        this.onmessage?.(payload.toString("utf8"));
+        this.callbacks.onmessage?.(payload.toString("utf8"));
       } else if (opcode === 9) {
         const pong = Buffer.concat([Buffer.from([138]), Buffer.from([payload.length]), payload]);
         this.socket?.write(pong);
@@ -132,102 +344,19 @@ var RawWs = class {
         this.closed = true;
         const code = payload.length >= 2 ? payload.readUInt16BE(0) : 1005;
         const reason = payload.length > 2 ? payload.subarray(2).toString() : "";
-        this.onclose?.(code, reason);
+        this.callbacks.onclose?.(code, reason);
       }
     }
   }
 };
-function scanLocks(lockDir, logger) {
-  let entries;
-  try {
-    entries = readdirSync(lockDir);
-  } catch (error) {
-    logger.warn(`ide-context: cannot read lock directory ${lockDir}: ${error instanceof Error ? error.message : String(error)}`);
-    return void 0;
-  }
-  const candidates = [];
-  for (const entry of entries.sort()) {
-    if (!entry.endsWith(".lock")) continue;
-    const path = join(lockDir, entry);
-    let mtime;
-    try {
-      mtime = statSync(path).mtimeMs;
-    } catch {
-      continue;
-    }
-    const fileName = path.split(/[\\/]/).pop();
-    if (fileName === void 0) continue;
-    const port = Number(fileName.replace(".lock", ""));
-    if (!Number.isInteger(port) || port <= 0) continue;
-    let parsed;
-    try {
-      parsed = JSON.parse(readFileSync(path, "utf8"));
-    } catch (error) {
-      logger.warn(`ide-context: unreadable lock file ${path}: ${error instanceof Error ? error.message : String(error)}`);
-      continue;
-    }
-    const root = parsed;
-    if (typeof root.authToken !== "string" || root.authToken.length === 0) continue;
-    const folders = Array.isArray(root.workspaceFolders) ? root.workspaceFolders.filter((item) => typeof item === "string") : [];
-    candidates.push({
-      path,
-      mtime,
-      lock: {
-        port,
-        ideName: typeof root.ideName === "string" ? root.ideName : void 0,
-        pid: typeof root.pid === "number" ? root.pid : void 0,
-        workspaceFolders: folders,
-        authToken: root.authToken
-      }
-    });
-  }
-  candidates.sort((a, b) => b.mtime - a.mtime);
-  return candidates;
-}
-function scanLatestLock(lockDir, logger) {
-  return scanLocks(lockDir, logger)?.[0]?.lock;
-}
-function normalizePathForCompare(path) {
-  const absolute = resolve(path);
-  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
-}
-function isWithinRoot(path, root) {
-  const p = normalizePathForCompare(path);
-  const r = normalizePathForCompare(root);
-  if (p === r) return true;
-  return p.startsWith(`${r}${sep}`);
-}
-function uniqueRoots(roots) {
-  const out = [];
-  for (const root of roots) {
-    if (root.length === 0) continue;
-    if (out.some((existing) => isWithinRoot(root, existing))) continue;
-    out.push(root);
-  }
-  return out;
-}
-function selectLockByWorkspace(candidates, cwd) {
-  if (cwd !== void 0) {
-    let best;
-    for (const candidate of candidates) {
-      if (!candidate.lock.workspaceFolders.some((folder) => isWithinRoot(cwd, folder))) continue;
-      if (best === void 0 || candidate.mtime > best.mtime) best = candidate;
-    }
-    if (best !== void 0) return best;
-  }
-  return candidates[0];
-}
-function filterFilesUnderRoots(files, roots) {
-  if (roots.length === 0) return files;
-  return files.filter((file) => roots.some((root) => isWithinRoot(file, root)));
-}
-var OPENED_FILES_TOOLS = ["get_all_opened_file_paths", "getOpenEditors"];
-var SELECTION_TOOLS = ["getCurrentSelection", "getLatestSelection"];
+
+// src/bridge.ts
 var IdeBridge = class {
   constructor(lockDir, pollIntervalMs, logger) {
     this.lockDir = lockDir;
     this.pollIntervalMs = pollIntervalMs;
     this.logger = logger;
+    validatePositiveInteger(pollIntervalMs, "pollIntervalMs");
   }
   lockDir;
   pollIntervalMs;
@@ -244,7 +373,7 @@ var IdeBridge = class {
   lockPath;
   /** Session working directory the bridge currently follows; `undefined` until first follow call. */
   cwd;
-  /** Workspace folders of the lock currently selected (used to detect same-port content changes). */
+  /** Workspace folders of the lock currently selected (to detect same-port content changes). */
   selectedFolders = [];
   nextRequestId = 1;
   pending = /* @__PURE__ */ new Map();
@@ -254,12 +383,12 @@ var IdeBridge = class {
   disposed = false;
   /** Waiters blocking `awaitLatest` until substantive data (files/selection) arrives. */
   readyWaiters = /* @__PURE__ */ new Set();
+  // -------------------------------------------------------------------------
+  // Snapshot reads
+  // -------------------------------------------------------------------------
   /**
    * Latest IDE snapshot, or `undefined` before any substantive data arrived.
-   * `ideName` alone is connection metadata, not context: it is written as soon
-   * as a lock is adopted, before the first async poll of opened files and the
-   * selection returns. Treating it as "data" would emit a half-empty rendering
-   * (just `ide: <name>`) on a fresh session's first step.
+   * `ideName` alone is connection metadata, not context.
    */
   latest() {
     const { snapshot } = this;
@@ -270,15 +399,13 @@ var IdeBridge = class {
   }
   /**
    * Resolve to the latest snapshot, blocking up to `timeoutMs` for the first
-   * substantive data to arrive. On a fresh connection the async handshake and
-   * first poll have not returned yet when an eligible step fires; without this
-   * wait that first step would inject nothing. When opened files arrive before
-   * the selection (push-only IDEs like IntelliJ deliver `selection_changed`
-   * slightly later), it keeps waiting within the same timeout so the first step
-   * still carries the selection rather than a files-only snapshot. Returns
-   * `undefined` when nothing arrives within the timeout.
+   * substantive data to arrive. When opened files arrive before the selection
+   * (push-only IDEs deliver `selection_changed` slightly later), it keeps
+   * waiting within the same deadline so the first step still carries the
+   * selection rather than a files-only snapshot.
    */
   async awaitLatest(timeoutMs) {
+    validatePositiveInteger(timeoutMs, "timeoutMs");
     const deadline = Date.now() + timeoutMs;
     const first = await this.waitForData(deadline);
     if (first === void 0) return void 0;
@@ -316,25 +443,19 @@ var IdeBridge = class {
     for (const waiter of this.readyWaiters) waiter();
     this.readyWaiters.clear();
   }
+  // -------------------------------------------------------------------------
+  // Workspace selection
+  // -------------------------------------------------------------------------
   /**
-   * Re-select the lock by a session working directory: prefer a lock whose
-   * workspace folder exactly equals `cwd`, else the newest lock. Reconnects
-   * only when the chosen lock differs from the current one. The selected lock
-   * is identified by its port *and* workspace folders — a same-port lock whose
-   * `workspaceFolders` content changed (the same editor window switched
-   * projects) still triggers a rebuild, unlike a bare port comparison.
-   * @param cwd - the session's working directory, or `undefined` to follow the newest lock.
+   * Re-select the lock by a session working directory. The selected lock is
+   * identified by its port *and* workspace folders — a same-port lock whose
+   * `workspaceFolders` changed (same window switched projects) still rebuilds.
    */
   followWorkspace(cwd) {
     if (this.disposed) return;
     this.cwd = cwd;
     this.reselect();
   }
-  /**
-   * Re-scan locks and adopt the lock selected for {@link cwd}, or `undefined`.
-   * Rebuilds workspace filters and reconnects whenever the selected lock's
-   * identity (port or workspace folders) changed since the last adoption.
-   */
   reselect() {
     if (this.disposed) return;
     const candidates = scanLocks(this.lockDir, this.logger) ?? [];
@@ -344,7 +465,6 @@ var IdeBridge = class {
     if (lock !== void 0 && this.sameSelection(lock.port, folders)) return;
     this.adoptLock(selected);
   }
-  /** True when `port` + `folders` describe the lock already adopted. */
   sameSelection(port, folders) {
     const path = `${port}.lock`;
     if (path !== this.lockPath) return false;
@@ -354,7 +474,6 @@ var IdeBridge = class {
     }
     return true;
   }
-  /** Adopt a selected lock (or `undefined`): reset filters and reconnect. */
   adoptLock(selected) {
     const lock = selected?.lock;
     const folders = lock?.workspaceFolders ?? [];
@@ -369,7 +488,9 @@ var IdeBridge = class {
     };
     if (lock !== void 0) this.connect(lock);
   }
-  /** Start lock scanning and polling. */
+  // -------------------------------------------------------------------------
+  // Lifecycle
+  // -------------------------------------------------------------------------
   start() {
     this.rescan();
     this.lockTimer = setInterval(() => {
@@ -379,7 +500,6 @@ var IdeBridge = class {
       this.poll();
     }, this.pollIntervalMs);
   }
-  /** Tear down the bridge: close the socket and all timers. */
   dispose() {
     this.disposed = true;
     if (this.lockTimer !== void 0) clearInterval(this.lockTimer);
@@ -387,20 +507,19 @@ var IdeBridge = class {
     this.ws?.close();
     this.ws = void 0;
   }
-  /** Re-evaluate the selected lock file; switch connections when it changed. */
   rescan() {
     this.reselect();
   }
-  /** Open (or re-open) the WebSocket + MCP session to one lock file. */
+  // -------------------------------------------------------------------------
+  // Connection
+  // -------------------------------------------------------------------------
   connect(lock) {
     this.ws?.close();
     const url = `ws://127.0.0.1:${lock.port}`;
     this.logger.debug(`ide-context: connecting to ${url} (${lock.ideName ?? "IDE"})`);
-    const ws = new RawWs(url, {
-      "X-Claude-Code-Ide-Authorization": lock.authToken
-    });
+    const ws = new RawWs(url, { "X-Claude-Code-Ide-Authorization": lock.authToken });
     this.ws = ws;
-    ws.onopen = () => {
+    ws.callbacks.onopen = () => {
       this.reconnectDelayMs = 500;
       this.logger.debug("ide-context: websocket connected");
       void this.rpc("initialize", {
@@ -416,14 +535,14 @@ var IdeBridge = class {
         }
       });
     };
-    ws.onmessage = (raw) => {
+    ws.callbacks.onmessage = (raw) => {
       this.handleMessage(raw);
     };
-    ws.onclose = (code, reason) => {
+    ws.callbacks.onclose = (code, reason) => {
       this.logger.warn(`ide-context: connection closed (${code} ${reason}); will retry`);
       this.scheduleReconnect();
     };
-    ws.onerror = (error) => {
+    ws.callbacks.onerror = (error) => {
       this.logger.warn(`ide-context: connection error: ${error.message}`);
       this.scheduleReconnect();
     };
@@ -440,7 +559,9 @@ var IdeBridge = class {
       if (selected !== void 0) this.adoptLock(selected);
     }, delay);
   }
-  /** Fire a JSON-RPC request; responses resolve via {@link handleMessage}. */
+  // -------------------------------------------------------------------------
+  // JSON-RPC
+  // -------------------------------------------------------------------------
   rpc(method, params) {
     const id = String(this.nextRequestId++);
     return new Promise((resolve2) => {
@@ -448,7 +569,6 @@ var IdeBridge = class {
       this.ws?.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
     });
   }
-  /** Dispatch one inbound JSON-RPC message. */
   handleMessage(raw) {
     let message;
     try {
@@ -473,7 +593,9 @@ var IdeBridge = class {
       this.applySelectionChanged(message.params);
     }
   }
-  /** Update the snapshot from a `selection_changed` notification. */
+  // -------------------------------------------------------------------------
+  // Incoming selection
+  // -------------------------------------------------------------------------
   applySelectionChanged(params) {
     const p = params;
     if (p === void 0) return;
@@ -498,7 +620,9 @@ var IdeBridge = class {
     };
     this.notifyData();
   }
-  /** Periodically refresh opened files and (where exposed) the selection. */
+  // -------------------------------------------------------------------------
+  // Polling
+  // -------------------------------------------------------------------------
   poll() {
     if (this.ws === void 0 || this.disposed) return;
     void this.refreshOpenedFiles();
@@ -524,110 +648,39 @@ var IdeBridge = class {
     this.snapshot.selection = selection;
     this.notifyData();
   }
-  /** True when `path` belongs under one of the current workspace roots (no roots = accept). */
   isInWorkspace(path) {
     return this.workspaceRoots.length === 0 || this.workspaceRoots.some((root) => isWithinRoot(path, root));
   }
-  /** Record the tool list once `tools/list` is answered. */
   setKnownTools(tools) {
     this.knownTools = tools;
     this.logger.debug(`ide-context: IDE tools: ${tools.join(", ")}`);
     void this.refreshOpenedFiles();
     void this.refreshSelection();
   }
-  /** Wire the `tools/list` response into {@link setKnownTools}. */
   handleToolsList(result) {
     const tools = result?.tools;
     if (!Array.isArray(tools)) return;
     this.setKnownTools(tools.map((tool) => typeof tool.name === "string" ? tool.name : ""));
   }
 };
-function extractOpenedFiles(result) {
-  const content = extractToolText(result);
-  if (content === void 0) return void 0;
-  const trimmed = content.trim();
-  const parsed = parseJson(trimmed);
-  if (parsed !== null && typeof parsed === "object") {
-    return extractFilePaths(parsed);
-  }
-  const files = trimmed.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0 && !line.startsWith("[") && !line.startsWith("{"));
-  return files.length > 0 ? files : void 0;
-}
-function parseJson(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return void 0;
-  }
-}
-function extractFilePaths(parsed) {
-  const items = Array.isArray(parsed) ? parsed : parsed !== null && typeof parsed === "object" && Array.isArray(parsed.tabs) ? parsed.tabs : void 0;
-  if (items === void 0) return [];
-  return items.map((item) => itemFilePath(item)).filter((file) => typeof file === "string" && file.length > 0);
-}
-function itemFilePath(item) {
-  if (typeof item === "string") return fileUriToPath(item);
-  if (item === null || typeof item !== "object") return void 0;
-  const record = item;
-  if (typeof record.fileName === "string" && isDiskPath(record.fileName)) return record.fileName;
-  if (typeof record.path === "string" && isDiskPath(record.path)) return record.path;
-  if (typeof record.uri === "string") return fileUriToPath(record.uri);
-  return void 0;
-}
-function isDiskPath(path) {
-  return /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(path) ? path.startsWith("file://") : true;
-}
-function fileUriToPath(uri) {
-  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(uri)) return uri;
-  if (!uri.startsWith("file://")) return void 0;
-  const rest = uri.slice("file://".length);
-  try {
-    return decodeURIComponent(rest);
-  } catch {
-    return rest;
-  }
-}
-function extractToolText(result) {
-  if (result === null || typeof result !== "object") return void 0;
-  const content = result.content;
-  if (Array.isArray(content)) {
-    for (const block of content) {
-      if (typeof block === "object" && block !== null && block.type === "text" && typeof block.text === "string") {
-        return block.text;
-      }
+
+// src/format.ts
+var claudeSelectionStrategy = {
+  render(selection) {
+    if (selection.start.line === 0 && selection.start.character === 0 && selection.end.line === 0 && selection.end.character === 0 && selection.text.length === 0) {
+      return void 0;
     }
-    return void 0;
+    const startLine = selection.start.line + 1;
+    const endLine = selection.end.line + 1;
+    const linesLabel = startLine === endLine ? `line ${startLine}` : `lines ${startLine} to ${endLine}`;
+    const lines = [`The user selected ${linesLabel} from ${selection.filePath}:`];
+    if (selection.text.length > 0) lines.push(selection.text);
+    lines.push("");
+    lines.push("This may or may not be related to the current task.");
+    return lines.join("\n");
   }
-  const text = result.text;
-  return typeof text === "string" ? text : void 0;
-}
-function extractSelectionToolResult(result) {
-  const text = extractToolText(result);
-  if (text === void 0) return void 0;
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    return void 0;
-  }
-  const filePath = typeof data.filePath === "string" ? data.filePath : void 0;
-  if (filePath === void 0) return void 0;
-  const selection = data.selection;
-  const selectedText = typeof data.text === "string" ? data.text : "";
-  if (selection === null || selection === void 0) {
-    return { filePath, start: { line: 0, character: 0 }, end: { line: 0, character: 0 }, text: selectedText };
-  }
-  const start = selection.start;
-  const end = selection.end;
-  if (start === void 0 || end === void 0) return void 0;
-  return {
-    filePath,
-    start: { line: Number(start.line) || 0, character: Number(start.character) || 0 },
-    end: { line: Number(end.line) || 0, character: Number(end.character) || 0 },
-    text: selectedText
-  };
-}
-function renderState(snapshot) {
+};
+function renderState(snapshot, strategy = claudeSelectionStrategy) {
   const lines = [];
   if (snapshot.ideName !== void 0) lines.push(`ide: ${snapshot.ideName}`);
   if (snapshot.openedFiles.length > 0) {
@@ -635,25 +688,18 @@ function renderState(snapshot) {
     for (const file of snapshot.openedFiles) lines.push(`- ${file}`);
   }
   const selection = snapshot.selection;
-  if (selection !== void 0 && (selection.start.line !== 0 || selection.start.character !== 0 || selection.end.line !== 0 || selection.end.character !== 0 || selection.text.length > 0)) {
-    const startLine = selection.start.line + 1;
-    const endLine = selection.end.line + 1;
-    const linesLabel = startLine === endLine ? `line ${startLine}` : `lines ${startLine} to ${endLine}`;
-    lines.push(`The user selected ${linesLabel} from ${selection.filePath}:`);
-    if (selection.text.length > 0) lines.push(selection.text);
-    lines.push("");
-    lines.push("This may or may not be related to the current task.");
+  if (selection !== void 0) {
+    const rendered = strategy.render(selection);
+    if (rendered !== void 0) lines.push(rendered);
   }
   return lines.join("\n");
 }
-function renderReading(snapshot, turn) {
+function renderReading(snapshot, turn, strategy) {
   return `${READING_PREFIX}${turn}):
-${renderState(snapshot)}`;
+${renderState(snapshot, strategy)}`;
 }
-async function readSnapshot(bridge, timeoutMs) {
-  if (typeof bridge.awaitLatest === "function") return await bridge.awaitLatest(timeoutMs);
-  return bridge.latest();
-}
+
+// src/index.ts
 function latestInjectedState(agent) {
   for (const event of [...agent.session.events].reverse()) {
     if (event.type === "user/message" && event.data.source.kind === "plugin" && event.data.source.plugin === name) {
@@ -666,10 +712,9 @@ function latestInjectedState(agent) {
   }
   return void 0;
 }
-function validatePositiveInteger(value, field) {
-  if (value !== void 0 && (!Number.isSafeInteger(value) || value < 0)) {
-    throw new TypeError(`ide-context: ${field} must be a non-negative safe integer, got ${String(value)}`);
-  }
+async function readSnapshot(bridge, timeoutMs) {
+  if (typeof bridge.awaitLatest === "function") return await bridge.awaitLatest(timeoutMs);
+  return bridge.latest();
 }
 function apply(ctx, config) {
   const refreshIntervalMs = config.refreshIntervalMs;
