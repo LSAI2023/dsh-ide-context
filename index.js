@@ -321,6 +321,10 @@ var RawWs = class {
     this.closed = true;
     this.socket?.end();
   }
+  /** True when the connection is established and not closed. */
+  isOpen() {
+    return !this.closed && this.socket !== void 0;
+  }
   consume(chunk) {
     this.buffer = Buffer.concat([this.buffer, chunk]);
     while (this.buffer.length >= 2) {
@@ -471,7 +475,7 @@ var IdeBridge = class {
     const selected = selectLockByWorkspace(candidates, this.cwd);
     const lock = selected?.lock;
     const folders = lock?.workspaceFolders ?? [];
-    if (lock !== void 0 && this.sameSelection(lock.port, folders)) return;
+    if (lock !== void 0 && this.sameSelection(lock.port, folders) && this.ws?.isOpen() === true) return;
     this.adoptLock(selected);
   }
   sameSelection(port, folders) {
@@ -563,9 +567,7 @@ var IdeBridge = class {
     this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, MAX_RECONNECT_DELAY_MS);
     setTimeout(() => {
       if (this.disposed) return;
-      const candidates = scanLocks(this.lockDir, this.logger) ?? [];
-      const selected = selectLockByWorkspace(candidates, this.cwd);
-      if (selected !== void 0) this.adoptLock(selected);
+      this.reselect();
     }, delay);
   }
   // -------------------------------------------------------------------------

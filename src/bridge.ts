@@ -155,7 +155,10 @@ export class IdeBridge {
     const selected = selectLockByWorkspace(candidates, this.cwd)
     const lock = selected?.lock
     const folders = lock?.workspaceFolders ?? []
-    if (lock !== undefined && this.sameSelection(lock.port, folders)) return
+    // Short-circuit only when the same lock is already selected AND the
+    // connection is still alive. A same-lock selection with a dropped socket
+    // must reconnect (the socket closed independently of the lock identity).
+    if (lock !== undefined && this.sameSelection(lock.port, folders) && this.ws?.isOpen() === true) return
     this.adoptLock(selected)
   }
 
@@ -249,9 +252,10 @@ export class IdeBridge {
     this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, MAX_RECONNECT_DELAY_MS)
     setTimeout(() => {
       if (this.disposed) return
-      const candidates = scanLocks(this.lockDir, this.logger) ?? []
-      const selected = selectLockByWorkspace(candidates, this.cwd)
-      if (selected !== undefined) this.adoptLock(selected)
+      // Re-select through reselect() so a stale reconnect (whose deadline landed
+      // after followWorkspace already adopted the same lock) short-circuits via
+      // sameSelection instead of tearing down a healthy connection and reconnecting.
+      this.reselect()
     }, delay)
   }
 

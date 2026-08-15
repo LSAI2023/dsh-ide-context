@@ -106,6 +106,11 @@ export class RawWs {
     this.socket?.end()
   }
 
+  /** True when the connection is established and not closed. */
+  isOpen(): boolean {
+    return !this.closed && this.socket !== undefined
+  }
+
   private consume(chunk: Buffer): void {
     this.buffer = Buffer.concat([this.buffer, chunk])
     while (this.buffer.length >= 2) {
