@@ -251,10 +251,16 @@ var IdeBridge = class {
   pollTimer;
   reconnectDelayMs = 500;
   disposed = false;
-  /** Latest IDE snapshot, or `undefined` before any data arrived. */
+  /**
+   * Latest IDE snapshot, or `undefined` before any substantive data arrived.
+   * `ideName` alone is connection metadata, not context: it is written as soon
+   * as a lock is adopted, before the first async poll of opened files and the
+   * selection returns. Treating it as "data" would emit a half-empty rendering
+   * (just `ide: <name>`) on a fresh session's first step.
+   */
   latest() {
     const { snapshot } = this;
-    if (snapshot.ideName === void 0 && snapshot.openedFiles.length === 0 && snapshot.selection === void 0) {
+    if (snapshot.openedFiles.length === 0 && snapshot.selection === void 0) {
       return void 0;
     }
     return snapshot;

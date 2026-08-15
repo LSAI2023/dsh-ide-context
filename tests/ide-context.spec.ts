@@ -195,6 +195,19 @@ describe('IdeBridge.followWorkspace rebuilding', () => {
 
     expect(connect.mock.calls.length).toBe(afterFirst)
   })
+
+  it('latest() is undefined while only ideName is known (no files/selection yet)', () => {
+    dir = mkdtempSync(join(tmpdir(), 'ide-context-'))
+    lockFile(65291, ['/Users/lsai/workspace/project-a'])
+    bridge = new IdeBridge(dir, 5000, quietLogger)
+    vi.spyOn(IdeBridge.prototype as never, 'connect' as never).mockImplementation(() => {})
+
+    // Adopting the lock writes ideName immediately, before any poll returns.
+    bridge.followWorkspace('/Users/lsai/workspace/project-a')
+
+    // ideName alone is connection metadata, not injectable context.
+    expect(bridge.latest()).toBeUndefined()
+  })
 })
 
 // ---------------------------------------------------------------------------

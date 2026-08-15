@@ -427,10 +427,16 @@ export class IdeBridge {
     private readonly logger: LoggerService,
   ) {}
 
-  /** Latest IDE snapshot, or `undefined` before any data arrived. */
+  /**
+   * Latest IDE snapshot, or `undefined` before any substantive data arrived.
+   * `ideName` alone is connection metadata, not context: it is written as soon
+   * as a lock is adopted, before the first async poll of opened files and the
+   * selection returns. Treating it as "data" would emit a half-empty rendering
+   * (just `ide: <name>`) on a fresh session's first step.
+   */
   latest(): IdeSnapshot | undefined {
     const { snapshot } = this
-    if (snapshot.ideName === undefined && snapshot.openedFiles.length === 0 && snapshot.selection === undefined) {
+    if (snapshot.openedFiles.length === 0 && snapshot.selection === undefined) {
       return undefined
     }
     return snapshot
