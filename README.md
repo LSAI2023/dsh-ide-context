@@ -1,5 +1,7 @@
 # dsh-ide-context
 
+English | [中文](README.zh.md)
+
 A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) bundle that carries what you are doing in your IDE right now into each model turn: the files currently open and the current text selection (file path, zero-based line/character range, selected text).
 
 It reads the **Claude Code IDE integration** bridge — the same `~/.claude/ide/<port>.lock` files and MCP-over-WebSocket protocol the Claude Code CLI uses — so one bundle serves both **IntelliJ IDEA** and **Visual Studio Code**.
@@ -11,7 +13,7 @@ It reads the **Claude Code IDE integration** bridge — the same `~/.claude/ide/
 dsh plugin add dsh-ide-context
 
 # or straight from a git host
-dsh plugin add github:you/dsh-ide-context
+dsh plugin add github:LSAI2023/dsh-ide-context
 ```
 
 Then boot a profile that lists this bundle:
