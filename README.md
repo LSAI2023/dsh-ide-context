@@ -42,13 +42,15 @@ ide: IntelliJ IDEA
 opened files (2):
 - /work/project/src/main/java/com/example/Main.java
 - /work/project/pom.xml
-selection: /work/project/src/main/java/com/example/Main.java 14:0 - 18:1
+The user selected lines 15 to 19 from /work/project/src/main/java/com/example/Main.java:
     public static void main(String[] args) {
         System.out.println("hello");
     }
+
+This may or may not be related to the current task.
 ```
 
-Positions are **zero-based** (IntelliJ `LogicalPosition` / VS Code `Position` semantics).
+The selection block uses Claude Code's editor-selection structure: a 1-based inclusive line range, the selected text, and a fixed "may or may not be related" tail. Opened files are resolved by the IDE whose workspace exactly matches the session's working directory, falling back to the newest lock when none matches.
 
 ## Requirements
 
@@ -57,7 +59,7 @@ Positions are **zero-based** (IntelliJ `LogicalPosition` / VS Code `Position` se
 
 ## Notes
 
-- **Single IDE** — the bridge follows the newest lock file. If both IntelliJ and VS Code are open, only the newest is followed.
+- **Workspace matching** — the bridge prefers the IDE whose `workspaceFolders` exactly contains the session's working directory, then falls back to the newest lock. With both IntelliJ and VS Code open, the project you launched dsh from wins.
 - **IntelliJ selection is push-based** — a selection made before the plugin connected is not backfilled; VS Code additionally supports polling.
 - The runtime peer dependency `@deepseek-ai/dsh-llm` and dependency `@deepseek-ai/schemastery` resolve from the DeepSeek Harness installation.
 

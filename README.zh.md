@@ -42,13 +42,15 @@ ide: IntelliJ IDEA
 opened files (2):
 - /work/project/src/main/java/com/example/Main.java
 - /work/project/pom.xml
-selection: /work/project/src/main/java/com/example/Main.java 14:0 - 18:1
+The user selected lines 15 to 19 from /work/project/src/main/java/com/example/Main.java:
     public static void main(String[] args) {
         System.out.println("hello");
     }
+
+This may or may not be related to the current task.
 ```
 
-位置为 **0-based**（IntelliJ `LogicalPosition` / VS Code `Position` 语义）。
+选区块采用 Claude Code 的编辑器选区结构：1-based 的闭区间行号、选中文本，以及一句固定的 "可能相关也可能无关" 结尾。打开的文件由 `workspaceFolders` 与当前会话工作目录**精确匹配**的那个 IDE 解析，都不匹配时回退到最新的 lock。
 
 ## 依赖要求
 
@@ -57,7 +59,7 @@ selection: /work/project/src/main/java/com/example/Main.java 14:0 - 18:1
 
 ## 注意事项
 
-- **单一 IDE** —— 桥只跟随最新的 lock 文件。若 IntelliJ 与 VS Code 同时打开，只跟随最新者。
+- **工作区匹配** —— 桥优先选择 `workspaceFolders` 精确包含当前会话工作目录的那个 IDE，都不匹配时回退到最新的 lock。IntelliJ 与 VS Code 同时打开时，以你启动 dsh 所在的项目为准。
 - **IntelliJ 选区是推送式** —— 插件连接之前做出的选区不会回填；VS Code 额外支持轮询。
 - 运行时 peer 依赖 `@deepseek-ai/dsh-llm` 与依赖 `@deepseek-ai/schemastery` 从 DeepSeek Harness 安装中解析。
 

@@ -176,6 +176,60 @@ var RawWs = class {
 	}
 };
 /**
+* Read and parse every `<port>.lock` under the lock directory, newest first,
+* or `undefined` when the directory is missing/unreadable or holds no
+* readable lock files. Unreadable or token-less files are skipped with a
+* warning (matching the newest-only reader's prior behavior).
+* Exported for tests and for the {@link scanLatestLock} wrapper.
+*/
+function scanLocks(lockDir, logger) {
+	let entries;
+	try {
+		entries = readdirSync(lockDir);
+	} catch (error) {
+		logger.warn(`ide-context: cannot read lock directory ${lockDir}: ${error instanceof Error ? error.message : String(error)}`);
+		return;
+	}
+	const candidates = [];
+	for (const entry of entries.sort()) {
+		if (!entry.endsWith(".lock")) continue;
+		const path = join(lockDir, entry);
+		let mtime;
+		try {
+			mtime = statSync(path).mtimeMs;
+		} catch {
+			continue;
+		}
+		const fileName = path.split(/[\\/]/).pop();
+		if (fileName === void 0) continue;
+		const port = Number(fileName.replace(".lock", ""));
+		if (!Number.isInteger(port) || port <= 0) continue;
+		let parsed;
+		try {
+			parsed = JSON.parse(readFileSync(path, "utf8"));
+		} catch (error) {
+			logger.warn(`ide-context: unreadable lock file ${path}: ${error instanceof Error ? error.message : String(error)}`);
+			continue;
+		}
+		const root = parsed;
+		if (typeof root.authToken !== "string" || root.authToken.length === 0) continue;
+		const folders = Array.isArray(root.workspaceFolders) ? root.workspaceFolders.filter((item) => typeof item === "string") : [];
+		candidates.push({
+			path,
+			mtime,
+			lock: {
+				port,
+				ideName: typeof root.ideName === "string" ? root.ideName : void 0,
+				pid: typeof root.pid === "number" ? root.pid : void 0,
+				workspaceFolders: folders,
+				authToken: root.authToken
+			}
+		});
+	}
+	candidates.sort((a, b) => b.mtime - a.mtime);
+	return candidates;
+}
+/**
 * Read the newest `<port>.lock` under the lock directory, or `undefined` when
 * the directory is missing/unreadable or holds no lock files. The newest file
 * is selected by modification time, matching the Claude Code CLI's own
@@ -184,48 +238,26 @@ var RawWs = class {
 * without starting a bridge.
 */
 function scanLatestLock(lockDir, logger) {
-	let entries;
-	try {
-		entries = readdirSync(lockDir);
-	} catch (error) {
-		logger.warn(`ide-context: cannot read lock directory ${lockDir}: ${error instanceof Error ? error.message : String(error)}`);
-		return;
-	}
-	const locks = entries.filter((entry) => entry.endsWith(".lock")).map((entry) => {
-		const path = join(lockDir, entry);
-		try {
-			return {
-				path,
-				mtime: statSync(path).mtimeMs
-			};
-		} catch {
-			return;
+	return scanLocks(lockDir, logger)?.[0]?.lock;
+}
+/**
+* Select one lock to follow. When a session working directory is supplied and
+* some candidate lists it exactly as one of its workspace folders, the newest
+* such candidate wins — so an IntelliJ and a VS Code both running pick the one
+* whose project is the current session. With no cwd, or no exact match, the
+* plain newest lock wins.
+* Exported for tests.
+*/
+function selectLockByWorkspace(candidates, cwd) {
+	if (cwd !== void 0) {
+		let best;
+		for (const candidate of candidates) {
+			if (!candidate.lock.workspaceFolders.includes(cwd)) continue;
+			if (best === void 0 || candidate.mtime > best.mtime) best = candidate;
 		}
-	}).filter((entry) => entry !== void 0).sort((a, b) => b.mtime - a.mtime);
-	if (locks.length === 0) return void 0;
-	const latest = locks[0];
-	if (latest === void 0) return void 0;
-	const fileName = latest.path.split(/[\\/]/).pop();
-	if (fileName === void 0) return void 0;
-	const port = Number(fileName.replace(".lock", ""));
-	if (!Number.isInteger(port) || port <= 0) return void 0;
-	let parsed;
-	try {
-		parsed = JSON.parse(readFileSync(latest.path, "utf8"));
-	} catch (error) {
-		logger.warn(`ide-context: unreadable lock file ${latest.path}: ${error instanceof Error ? error.message : String(error)}`);
-		return;
+		if (best !== void 0) return best;
 	}
-	const root = parsed;
-	if (typeof root.authToken !== "string" || root.authToken.length === 0) return void 0;
-	const folders = Array.isArray(root.workspaceFolders) ? root.workspaceFolders.filter((item) => typeof item === "string") : [];
-	return {
-		port,
-		ideName: typeof root.ideName === "string" ? root.ideName : void 0,
-		pid: typeof root.pid === "number" ? root.pid : void 0,
-		workspaceFolders: folders,
-		authToken: root.authToken
-	};
+	return candidates[0];
 }
 /** Candidate tool names for the opened-file list, probed against tools/list. */
 const OPENED_FILES_TOOLS = ["get_all_opened_file_paths", "getOpenEditors"];
@@ -268,6 +300,27 @@ var IdeBridge = class {
 		const { snapshot } = this;
 		if (snapshot.ideName === void 0 && snapshot.openedFiles.length === 0 && snapshot.selection === void 0) return;
 		return snapshot;
+	}
+	/**
+	* Re-select the lock by a session working directory: prefer a lock whose
+	* workspace folder exactly equals `cwd`, else the newest lock. Reconnects
+	* only when the chosen lock differs from the current one.
+	* @param cwd - the session's working directory, or `undefined` to follow the newest lock.
+	*/
+	followWorkspace(cwd) {
+		if (this.disposed) return;
+		const selected = selectLockByWorkspace(scanLocks(this.lockDir, this.logger) ?? [], cwd);
+		const lock = selected?.lock;
+		const path = selected === void 0 ? void 0 : `${lock?.port}.lock`;
+		if (path === this.lockPath) return;
+		this.lockPath = path;
+		this.knownTools = [];
+		this.snapshot = {
+			ideName: lock?.ideName,
+			workspaceFolders: lock?.workspaceFolders ?? [],
+			openedFiles: []
+		};
+		if (lock !== void 0) this.connect(lock);
 	}
 	/** Start lock scanning and polling. */
 	start() {
@@ -581,8 +634,13 @@ function renderState(snapshot) {
 	}
 	const selection = snapshot.selection;
 	if (selection !== void 0 && (selection.start.line !== 0 || selection.start.character !== 0 || selection.end.line !== 0 || selection.end.character !== 0 || selection.text.length > 0)) {
-		lines.push(`selection: ${selection.filePath} ${selection.start.line}:${selection.start.character} - ${selection.end.line}:${selection.end.character}`);
+		const startLine = selection.start.line + 1;
+		const endLine = selection.end.line + 1;
+		const linesLabel = startLine === endLine ? `line ${startLine}` : `lines ${startLine} to ${endLine}`;
+		lines.push(`The user selected ${linesLabel} from ${selection.filePath}:`);
 		if (selection.text.length > 0) lines.push(selection.text);
+		lines.push("");
+		lines.push("This may or may not be related to the current task.");
 	}
 	return lines.join("\n");
 }
@@ -636,6 +694,7 @@ function apply(ctx, config) {
 	ctx.on("agent/pre-step", async ({ agent, turn, step, signal }, next) => {
 		const decision = await next();
 		if (decision.kind === "reject" || signal.aborted || step !== 1) return decision;
+		bridge.followWorkspace(agent.session.header.cwd);
 		const previous = latestInjectedState(agent);
 		if (refreshIntervalMs !== void 0 && refreshIntervalMs > 0 && previous !== void 0) {
 			const now = Date.now();
@@ -668,4 +727,4 @@ function apply(ctx, config) {
 	}, { prepend: true });
 }
 //#endregion
-export { Config, IdeBridge, apply, extractOpenedFiles, extractSelectionToolResult, inject, name, renderState, scanLatestLock };
+export { Config, IdeBridge, apply, extractOpenedFiles, extractSelectionToolResult, inject, name, renderState, scanLatestLock, scanLocks, selectLockByWorkspace };
