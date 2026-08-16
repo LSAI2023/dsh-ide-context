@@ -17,14 +17,30 @@ var OPENED_FILES_TOOLS = ["get_all_opened_file_paths", "getOpenEditors"];
 var SELECTION_TOOLS = ["getCurrentSelection", "getLatestSelection"];
 
 // src/lock.ts
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync as readFileSync2, statSync } from "node:fs";
 import { join as join2 } from "node:path";
 
 // src/platform.ts
-import { resolve, sep } from "node:path";
+import { readFileSync } from "node:fs";
+import { resolve, sep, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
+function detectPlatform() {
+  if (process.platform === "darwin") return "macos";
+  if (process.platform === "win32") return "windows";
+  if (process.platform === "linux") {
+    try {
+      const proc = readFileSync("/proc/version", "utf8").toLowerCase();
+      if (proc.includes("microsoft") || proc.includes("wsl")) return "wsl";
+    } catch {
+    }
+    return "linux";
+  }
+  return "unknown";
+}
 var SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
-var platform;
+function normalizeDriveLetter(path) {
+  return path.replace(/^[a-zA-Z]:/, (match) => match.toUpperCase());
+}
 var posix = {
   normalizePath: resolve,
   separator: sep,
@@ -48,8 +64,45 @@ var posix = {
     return SCHEME_RE.test(path) ? path.startsWith("file://") : true;
   }
 };
-function currentPlatform() {
-  return platform ??= posix;
+var win32Behavior = {
+  normalizePath(path) {
+    return normalizeDriveLetter(win32.resolve(path));
+  },
+  separator: win32.sep,
+  isWithinRoot(path, root) {
+    const p = win32Behavior.normalizePath(path);
+    const r = win32Behavior.normalizePath(root);
+    if (p === r) return true;
+    return p.startsWith(`${r}${win32Behavior.separator}`);
+  },
+  fileUriToPath(uri) {
+    if (!SCHEME_RE.test(uri)) {
+      return uri.includes("\\") ? uri.replace(/\\/g, "/") : uri;
+    }
+    if (!uri.toLowerCase().startsWith("file://")) return void 0;
+    try {
+      return fileURLToPath(uri);
+    } catch {
+      const rest = uri.slice("file://".length);
+      return decodeURIComponentFallback(rest).replace(/^\//, "");
+    }
+  },
+  isDiskPath(path) {
+    if (!SCHEME_RE.test(path)) return true;
+    if (path.toLowerCase().startsWith("file://")) return true;
+    return false;
+  }
+};
+var detected;
+function getPlatform() {
+  return detected ??= detectPlatform();
+}
+var behavior;
+function currentBehavior() {
+  if (behavior !== void 0) return behavior;
+  const platform = getPlatform();
+  behavior = platform === "windows" ? win32Behavior : posix;
+  return behavior;
 }
 function decodeURIComponentFallback(rest) {
   try {
@@ -59,13 +112,13 @@ function decodeURIComponentFallback(rest) {
   }
 }
 function isWithinRoot(path, root) {
-  return currentPlatform().isWithinRoot(path, root);
+  return currentBehavior().isWithinRoot(path, root);
 }
 function fileUriToPath(uri) {
-  return currentPlatform().fileUriToPath(uri);
+  return currentBehavior().fileUriToPath(uri);
 }
 function isDiskPath(path) {
-  return currentPlatform().isDiskPath(path);
+  return currentBehavior().isDiskPath(path);
 }
 
 // src/lock.ts
@@ -93,7 +146,7 @@ function scanLocks(lockDir, logger) {
     if (!Number.isInteger(port) || port <= 0) continue;
     let parsed;
     try {
-      parsed = JSON.parse(readFileSync(path, "utf8"));
+      parsed = JSON.parse(readFileSync2(path, "utf8"));
     } catch (error) {
       logger.warn(`ide-context: unreadable lock file ${path}: ${error instanceof Error ? error.message : String(error)}`);
       continue;
@@ -109,7 +162,8 @@ function scanLocks(lockDir, logger) {
         ideName: typeof root.ideName === "string" ? root.ideName : void 0,
         pid: typeof root.pid === "number" ? root.pid : void 0,
         workspaceFolders: folders,
-        authToken: root.authToken
+        authToken: root.authToken,
+        runningInWindows: root.runningInWindows === true
       }
     });
   }

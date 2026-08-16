@@ -5,18 +5,41 @@
  * backslash separators) becomes an isolated concern rather than scattered
  * `process.platform` branches across the codebase.
  *
- * The current implementation is POSIX-oriented; the `Platform` shape is the
- * seam to extend. Keep every call site going through the module-level helpers
- * so a future `win32` implementation only changes code here.
+ * Mirrors the platform vocabulary of the Claude Code CLI (`macos | windows |
+ * wsl | linux | unknown`) so lock-file discovery and workspace matching stay
+ * aligned with the IDE integration it speaks to. Windows (`win32`) is
+ * implemented here; WSL (Linux host + Windows IDE) path conversion is a
+ * separate future concern behind the same seam.
  * @module @deepseek-ai/dsh-ide-context/platform (internal)
  */
 
-import { resolve, sep } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { resolve, sep, win32 } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-/** The parts of platform behavior that differ between POSIX and Windows. */
-export interface Platform {
-  /** Canonicalize a path for equality/containment comparison. */
+/** Platform vocabulary shared with the Claude Code CLI. */
+export type Platform = 'macos' | 'windows' | 'wsl' | 'linux' | 'unknown'
+
+/** Detect the current platform once, in Claude Code's terms. */
+export function detectPlatform(): Platform {
+  if (process.platform === 'darwin') return 'macos'
+  if (process.platform === 'win32') return 'windows'
+  if (process.platform === 'linux') {
+    // WSL (Windows Subsystem for Linux) reports itself as linux.
+    try {
+      const proc = readFileSync('/proc/version', 'utf8').toLowerCase()
+      if (proc.includes('microsoft') || proc.includes('wsl')) return 'wsl'
+    } catch {
+      // Not running in a Linux environment that exposes /proc/version.
+    }
+    return 'linux'
+  }
+  return 'unknown'
+}
+
+/** The parts of path behavior that differ between POSIX and Windows. */
+export interface PathBehavior {
+  /** Canonicalize a path for equality/containment comparison (absolute, case-normalized). */
   normalizePath(path: string): string
   /** The separator used to test prefix containment (`a/starts with b/`). */
   separator: string
@@ -31,11 +54,16 @@ export interface Platform {
 /** Scheme prefix regex shared by POSIX and Windows: `<scheme>:` prefixes. */
 const SCHEME_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/
 
-/** The current platform implementation, selected once. */
-let platform: Platform | undefined
+/**
+ * Normalize a Windows drive-letter prefix (`c:` / `C:`) to uppercase for
+ * case-insensitive comparison, matching the Claude Code CLI's behavior.
+ */
+function normalizeDriveLetter(path: string): string {
+  return path.replace(/^[a-zA-Z]:/, match => match.toUpperCase())
+}
 
-/** POSIX implementation (the baseline). */
-const posix: Platform = {
+/** POSIX (macOS/Linux) path behavior. */
+const posix: PathBehavior = {
   normalizePath: resolve,
   separator: sep,
   isWithinRoot(path, root) {
@@ -61,11 +89,56 @@ const posix: Platform = {
   },
 }
 
-/** Selected platform accessor. POSIX is the sole implementation today; a future
- * `win32` impl (case-insensitive compare, drive letters, `file:///C:/...` URIs)
- * plugs in here without changing any call site. */
-function currentPlatform(): Platform {
-  return (platform ??= posix)
+/** Windows (native) path behavior: case-insensitive drives + backslash separators. */
+const win32Behavior: PathBehavior = {
+  normalizePath(path) {
+    return normalizeDriveLetter(win32.resolve(path))
+  },
+  separator: win32.sep,
+  isWithinRoot(path, root) {
+    const p = win32Behavior.normalizePath(path)
+    const r = win32Behavior.normalizePath(root)
+    if (p === r) return true
+    return p.startsWith(`${r}${win32Behavior.separator}`)
+  },
+  fileUriToPath(uri) {
+    if (!SCHEME_RE.test(uri)) {
+      // A bare Windows path may use backslashes; normalize to forward slashes
+      // for the rest of the pipeline. Drive-relative input passes through.
+      return uri.includes('\\') ? uri.replace(/\\/g, '/') : uri
+    }
+    if (!uri.toLowerCase().startsWith('file://')) return undefined
+    try {
+      // fileURLToPath handles file:///C:/path and file:///C:\path variants.
+      return fileURLToPath(uri)
+    } catch {
+      const rest = uri.slice('file://'.length)
+      return decodeURIComponentFallback(rest).replace(/^\//, '')
+    }
+  },
+  isDiskPath(path) {
+    // On Windows a bare <scheme>: is virtual; a drive letter (C:) is a real path.
+    if (!SCHEME_RE.test(path)) return true
+    if (path.toLowerCase().startsWith('file://')) return true
+    return false
+  },
+}
+
+let detected: Platform | undefined
+
+/** The current platform type (memoized). */
+export function getPlatform(): Platform {
+  return (detected ??= detectPlatform())
+}
+
+let behavior: PathBehavior | undefined
+
+/** Selected path behavior for the current platform. */
+function currentBehavior(): PathBehavior {
+  if (behavior !== undefined) return behavior
+  const platform = getPlatform()
+  behavior = platform === 'windows' ? win32Behavior : posix
+  return behavior
 }
 
 /** Fallback URI decode for malformed percent-encoding. */
@@ -79,12 +152,12 @@ function decodeURIComponentFallback(rest: string): string {
 
 /** Normalize a path to a trailing-slash-free absolute form for comparison. */
 export function normalizePathForCompare(path: string): string {
-  return currentPlatform().normalizePath(path)
+  return currentBehavior().normalizePath(path)
 }
 
 /** True when `path` equals `root` or lives under it (platform-aware). */
 export function isWithinRoot(path: string, root: string): boolean {
-  return currentPlatform().isWithinRoot(path, root)
+  return currentBehavior().isWithinRoot(path, root)
 }
 
 /**
@@ -92,10 +165,10 @@ export function isWithinRoot(path: string, root: string): boolean {
  * (`git:`, `output:`, ...) to `undefined`.
  */
 export function fileUriToPath(uri: string): string | undefined {
-  return currentPlatform().fileUriToPath(uri)
+  return currentBehavior().fileUriToPath(uri)
 }
 
 /** True when a bare path is a real filesystem path (not a virtual scheme). */
 export function isDiskPath(path: string): boolean {
-  return currentPlatform().isDiskPath(path)
+  return currentBehavior().isDiskPath(path)
 }

@@ -57,6 +57,8 @@ export interface LockInfo {
   pid: number | undefined
   workspaceFolders: string[]
   authToken: string
+  /** True when the IDE runs on Windows (enables WSL path/host handling later). */
+  runningInWindows: boolean
 }
 
 /** Reject non-negative non-safe-integer intervals (shared config validation). */

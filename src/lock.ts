@@ -66,6 +66,7 @@ export function scanLocks(lockDir: string, logger: LoggerService): LockCandidate
         pid: typeof root.pid === 'number' ? root.pid : undefined,
         workspaceFolders: folders,
         authToken: root.authToken,
+        runningInWindows: root.runningInWindows === true,
       },
     })
   }

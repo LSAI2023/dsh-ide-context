@@ -62,6 +62,7 @@ This may or may not be related to the current task.
 - **工作区匹配** —— 桥优先选择 `workspaceFolders` 包含当前会话工作目录（精确或父目录）的那个 IDE，都不匹配时回退到最新的 lock。IntelliJ 与 VS Code 同时打开时，以你启动 dsh 所在的项目为准。
 - **按项目范围过滤** —— 打开的文件与选区会过滤到会话工作目录及匹配到的 IDE 的 `workspaceFolders` 之下；无关项目的文件以及虚拟文档（`git:`、`output:` 等）会被丢弃，只返回当前项目的上下文。
 - **IntelliJ 选区是推送式** —— 插件连接之前做出的选区不会回填；VS Code 额外支持轮询。
+- **平台** —— 已支持原生 macOS 与原生 Windows（Windows 上 `~/.claude/ide` 解析为 `C:\Users\<user>\.claude\ide`，盘符比较不区分大小写）。WSL（Linux 宿主 + Windows IDE）的路径/主机转换尚未实现。
 - 运行时 peer 依赖 `@deepseek-ai/dsh-llm` 与依赖 `@deepseek-ai/schemastery` 从 DeepSeek Harness 安装中解析。
 
 ## 开发

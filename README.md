@@ -62,6 +62,7 @@ The selection block uses Claude Code's editor-selection structure: a 1-based inc
 - **Workspace matching** — the bridge prefers the IDE whose `workspaceFolders` contains the session's working directory (exact or a parent directory), then falls back to the newest lock. With both IntelliJ and VS Code open, the project you launched dsh from wins.
 - **Project-scoped results** — opened files and the selection are filtered to the session's working directory and the matched IDE's `workspaceFolders`; files from unrelated projects and virtual documents (`git:`, `output:`, …) are dropped so only the current project's context is returned.
 - **IntelliJ selection is push-based** — a selection made before the plugin connected is not backfilled; VS Code additionally supports polling.
+- **Platforms** — native macOS and native Windows are supported (`~/.claude/ide` resolves to `C:\Users\<user>\.claude\ide` on Windows; drive letters compare case-insensitively). WSL (Linux host + Windows IDE) path/host conversion is not implemented yet.
 - The runtime peer dependency `@deepseek-ai/dsh-llm` and dependency `@deepseek-ai/schemastery` resolve from the DeepSeek Harness installation.
 
 ## Development
